@@ -61,8 +61,14 @@ extern "C" void tud_resume_cb(void) {
 }
 
 void wake_on_bt_input(const uint8_t *hid_input, uint16_t len) {
-    if (len < 9) return;
-    const uint8_t ps_now = hid_input[8] & 0x01;
+    if (len < 10) return;
+    // DualSense BT 0x31 input report layout (after main.cpp's `data + 3` skip):
+    //   byte 7 low nibble: D-pad direction (0x08 idle); high nibble: face buttons
+    //   byte 8: L1, R1, L2 click, R2 click, share, options, L3, R3
+    //   byte 9: PS (bit 0), touchpad-click (bit 1), mute (bit 2)
+    // The PS bit is at byte 9, not byte 8 (which is L1). Verified by capturing
+    // per-button report deltas with a diagnostic firmware.
+    const uint8_t ps_now = hid_input[9] & 0x01;
 
     critical_section_enter_blocking(&wake_cs);
     const bool edge = (prev_ps_bit == 0 && ps_now == 1);

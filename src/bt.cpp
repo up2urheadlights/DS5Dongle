@@ -162,9 +162,12 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
             break;
         }
 
-        case GAP_EVENT_INQUIRY_COMPLETE:
+        case GAP_EVENT_INQUIRY_COMPLETE: {
+            printf("[HCI] GAP Inquiry complete.\n");
+            break;
+        }
         case HCI_EVENT_INQUIRY_COMPLETE: {
-            printf("[HCI] Inquiry complete.\n");
+            printf("[HCI] HCI Inquiry complete.\n");
             if (device_found) {
                 printf("[HCI] Connecting to %s...\n", bd_addr_to_str(current_device_addr));
                 new_pair = true;

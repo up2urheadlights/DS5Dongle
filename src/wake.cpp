@@ -15,10 +15,15 @@
 
 #define WAKE_KBD_INSTANCE     1
 #define WAKE_KEYCODE_F15      0x68
-#define WAKE_SETTLE_US        20000
-#define WAKE_KEY_HOLD_US      30000
-#define WAKE_KEY_UP_SETTLE_US 10000
+// Post-resume timings tuned for "wake-and-resleep" Windows behavior: the host
+// resumes USB, but if no HID input is consumed during the brief wake window
+// the system can re-suspend within ~1 s. Bigger settles + a second F15 give
+// Windows multiple polling cycles to pick the keystroke up.
+#define WAKE_SETTLE_US        150000   // 150 ms — let host finish USB re-init
+#define WAKE_KEY_HOLD_US       80000   // 80 ms keydown -> keyup gap
+#define WAKE_KEY_UP_SETTLE_US 200000   // 200 ms between attempts (or before DONE)
 #define WAKE_REQUEST_TIMEOUT_US 5000000
+#define WAKE_KEY_ATTEMPTS     2
 
 #ifdef WAKE_DEBUG
 #  define WAKE_DBG(fmt, ...) printf("[wake] " fmt "\n", ##__VA_ARGS__)
@@ -51,6 +56,7 @@ static volatile bool host_suspended = false;
 static volatile bool host_resumed_event = false;
 static wake_state_t state = WAKE_IDLE;
 static uint64_t state_entered_us = 0;
+static uint8_t key_attempts = 0;
 // Last-seen DualSense button bytes. Idle defaults: byte 7 = 0x08 (D-pad
 // released), bytes 8 / 9 = 0 (no shoulders, no PS / touchpad / mute).
 static uint8_t prev_b7 = 0x08;
@@ -74,6 +80,7 @@ extern "C" void tud_suspend_cb(bool remote_wakeup_en) {
         state = WAKE_PENDING_PRESS;
         state_entered_us = time_us_64();
         prev_b7 = 0x08; prev_b8 = 0x00; prev_b9 = 0x00;
+        key_attempts = 0;
         WAKE_DBG("-> PENDING_PRESS");
     }
 }
@@ -130,7 +137,7 @@ void wake_on_bt_input(const uint8_t *hid_input, uint16_t len) {
             static uint64_t last_log = 0;
             const uint64_t now = time_us_64();
             if (now - last_log > 5000000) {
-                WAKE_DBG("button event, tud_remote_wakeup()=0 (host awake or wake disabled) -- 5s heartbeat");
+                WAKE_DBG("button event, tud_remote_wakeup()=0 (USB bus not in suspend) -- 5s heartbeat");
                 last_log = now;
             }
         }
@@ -182,7 +189,7 @@ void wake_task(void) {
                     critical_section_exit(&wake_cs);
                 }
             } else if (now - entered > WAKE_REQUEST_TIMEOUT_US) {
-                WAKE_DBG("REQUESTED timeout 5s -> DONE (host never resumed)");
+                WAKE_DBG("REQUESTED timeout 5s -> DONE (no resume signaling; may have already woken)");
                 critical_section_enter_blocking(&wake_cs);
                 enter_state(WAKE_DONE);
                 critical_section_exit(&wake_cs);
@@ -215,10 +222,39 @@ void wake_task(void) {
 
         case WAKE_KEY_UP_SENT: {
             if (now - entered < WAKE_KEY_UP_SETTLE_US) return;
-            WAKE_DBG("KEY_UP_SENT settle done -> DONE");
-            critical_section_enter_blocking(&wake_cs);
-            enter_state(WAKE_DONE);
-            critical_section_exit(&wake_cs);
+            key_attempts++;
+            if (key_attempts < WAKE_KEY_ATTEMPTS) {
+                // Retry: do NOT re-enter WAKE_REQUESTED (which gates on a
+                // fresh tud_resume_cb event). We already established the
+                // host woke once; just send another keydown directly. If the
+                // host has dipped back into suspend, tud_hid_n_ready will be
+                // false and we'll heartbeat from KEY_DOWN until it returns.
+                if (!tud_hid_n_ready(WAKE_KBD_INSTANCE)) {
+#ifdef WAKE_DEBUG
+                    static uint64_t last_log = 0;
+                    if (now - last_log > 1000000) {
+                        WAKE_DBG("KEY_UP_SENT retry waiting: hid_n_ready=0 (heartbeat 1Hz)");
+                        last_log = now;
+                    }
+#endif
+                    return;
+                }
+                uint8_t rpt[8] = { 0, 0, WAKE_KEYCODE_F15, 0, 0, 0, 0, 0 };
+                const bool sent = tud_hid_n_report(WAKE_KBD_INSTANCE, 0, rpt, sizeof(rpt));
+                WAKE_DBG("KEY_UP_SENT: retrying F15 (attempt %d/%d) -> %d",
+                         (int)key_attempts + 1, (int)WAKE_KEY_ATTEMPTS, (int)sent);
+                if (sent) {
+                    critical_section_enter_blocking(&wake_cs);
+                    enter_state(WAKE_KEY_DOWN);
+                    critical_section_exit(&wake_cs);
+                }
+            } else {
+                WAKE_DBG("KEY_UP_SENT settle done -> DONE");
+                critical_section_enter_blocking(&wake_cs);
+                enter_state(WAKE_DONE);
+                key_attempts = 0;
+                critical_section_exit(&wake_cs);
+            }
             return;
         }
     }

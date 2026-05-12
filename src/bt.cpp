@@ -305,7 +305,12 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
         }
 
         case HCI_EVENT_DISCONNECTION_COMPLETE: {
-#if !ENABLE_SERIAL
+#if !ENABLE_SERIAL && !defined(ENABLE_WAKE_HID)
+            // Without ENABLE_WAKE_HID we hide the USB device whenever no
+            // controller is paired (upstream behavior). With wake enabled
+            // we must stay on the bus across controller power-cycles, so
+            // tud_suspend_cb can later fire and tud_remote_wakeup() can
+            // signal a wake when the controller is turned back on.
             tud_disconnect();
 #endif
             gap_connectable_control(1);

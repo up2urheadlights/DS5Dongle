@@ -62,10 +62,11 @@ void state_update(const uint8_t *data, const uint8_t size) {
         byte = (byte & ~(1 << bit)) | (value << bit);
     };
 
+    set_bit(state[0], 0, update.EnableRumbleEmulation);
     set_bit(state[0], 1, update.UseRumbleNotHaptics);
     set_bit(state[38], 2, update.EnableImprovedRumbleEmulation);
     copy_if_allowed(
-        update.EnableRumbleEmulation,
+        update.UseRumbleNotHaptics || update.EnableRumbleEmulation,
         offsetof(SetStateData, RumbleEmulationRight),
         2
     );

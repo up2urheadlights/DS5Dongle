@@ -23,8 +23,13 @@ if (EXISTS ${picoVscode})
     include(${picoVscode})
 endif ()
 # ====================================================================================
-set(PICO_BOARD pico2_w CACHE STRING "Board type")
 
+if (PICO_W_BUILD)
+        set(PICO_BOARD pico_w CACHE STRING "Board type")
+        set(PICO_RP2350 OFF CACHE BOOL "Not using RP2350")
+else ()
+        set(PICO_BOARD pico2_w CACHE STRING "Board type")
+endif ()
 #set(PICO_CYW43_SUPPORTED 1)
 #set(PICO_CYW43_ARCH_THREADSAFE_BACKGROUND 1)
 
@@ -46,6 +51,23 @@ if (ENABLE_BATT_LED)
 else ()
         set(ENABLE_BATT_LED_VALUE 0)
 endif ()
+option(DISABLE_SPEAKER_PROC "Disable Speaker in controller" OFF)
+if (DISABLE_SPEAKER_PROC)
+        set(DISABLE_SPEAKER_PROC_VALUE 1)
+else ()
+        set(DISABLE_SPEAKER_PROC_VALUE 0)
+endif ()
+option(PICO_W_BUILD "Build for Rasberry Pi Pico W, audio is missing" OFF)
+if (PICO_W_BUILD)
+        set(CYW43_PIO_CLOCK_DIV_VALUE 3)
+        set(SYS_CLOCK_KHZ_VALUE 200000)
+        set(DISABLE_SPEAKER_PROC_VALUE 1)
+else ()
+        set(CYW43_PIO_CLOCK_DIV_VALUE 5)
+        set(SYS_CLOCK_KHZ_VALUE 320000)
+endif ()
+
+
 
 # Pull in Raspberry Pi Pico SDK (must be before project)
 include(pico_sdk_import.cmake)
@@ -93,12 +115,14 @@ target_compile_definitions(ds5-bridge PRIVATE
         ENABLE_SERIAL=${ENABLE_SERIAL_VALUE}
         PICO_FLASH_ASSUME_CORE1_SAFE=1
         WDL_RESAMPLE_TYPE=float
-        CYW43_PIO_CLOCK_DIV_INT=5
+        CYW43_PIO_CLOCK_DIV_INT=${CYW43_PIO_CLOCK_DIV_VALUE}
         PICO_STDIO_USB_USE_DEFAULT_DESCRIPTORS=0
         PICO_STDIO_USB_ENABLE_RESET_VIA_BAUD_RATE=0
         PICO_STDIO_USB_ENABLE_RESET_VIA_VENDOR_INTERFACE=0
         ENABLE_VERBOSE=${ENABLE_VERBOSE_VALUE}
         ENABLE_BATT_LED=${ENABLE_BATT_LED_VALUE}
+        SYS_CLOCK_KHZ=${SYS_CLOCK_KHZ_VALUE}
+        DISABLE_SPEAKER_PROC=${DISABLE_SPEAKER_PROC_VALUE}
 )
 
 option(ENABLE_WAKE_HID "Wake the Windows host on PS-button press" OFF)
@@ -118,8 +142,10 @@ if(WAKE_DEBUG)
     )
 endif()
 
+set(VERSION "dev" CACHE STRING "Program version string")
+
 pico_set_program_name(ds5-bridge "ds5-bridge")
-pico_set_program_version(ds5-bridge "0.5.3")
+pico_set_program_version(ds5-bridge "${VERSION}")
 
 # Modify the below lines to enable/disable output over UART/USB
 pico_enable_stdio_uart(ds5-bridge 1)

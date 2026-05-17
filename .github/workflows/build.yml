@@ -30,6 +30,9 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Set firmware version
+        run: printf 'FIRMWARE_VERSION=%s\n' "${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+
       - name: Prepare build dependency cache
         id: apt-cache
         run: |
@@ -79,7 +82,8 @@ jobs:
         run: |
           cmake -S . -B build/standard -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DPICO_SDK_PATH="$PICO_SDK_PATH"
+            -DPICO_SDK_PATH="$PICO_SDK_PATH" \
+            -DVERSION="$FIRMWARE_VERSION"
           cmake --build build/standard --target ds5-bridge
           mkdir -p artifacts
           cp build/standard/ds5-bridge.uf2 artifacts/ds5-bridge.uf2
@@ -90,9 +94,29 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DPICO_SDK_PATH="$PICO_SDK_PATH" \
             -DENABLE_SERIAL=ON \
-            -DENABLE_VERBOSE=ON
+            -DENABLE_VERBOSE=ON \
+            -DVERSION="$FIRMWARE_VERSION"
           cmake --build build/debug --target ds5-bridge
           cp build/debug/ds5-bridge.uf2 artifacts/ds5-bridge-debug.uf2
+
+      - name: Build no-batt-led firmware (compile check only)
+        run: |
+          cmake -S . -B build/no-batt-led -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DPICO_SDK_PATH="$PICO_SDK_PATH" \
+            -DENABLE_BATT_LED=OFF \
+            -DVERSION="$FIRMWARE_VERSION"
+          cmake --build build/no-batt-led --target ds5-bridge
+
+      - name: Build Pico W firmware
+        run: |
+          cmake -S . -B build/picow -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DPICO_SDK_PATH="$PICO_SDK_PATH" \
+            -DPICO_W_BUILD=ON \
+            -DVERSION="$FIRMWARE_VERSION"
+          cmake --build build/picow --target ds5-bridge
+          cp build/picow/ds5-bridge.uf2 artifacts/ds5-bridge-picow.uf2
 
       - name: Build wake firmware
         run: |
@@ -100,15 +124,9 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DPICO_SDK_PATH="$PICO_SDK_PATH" \
             -DENABLE_WAKE_HID=ON
+            -DVERSION="$FIRMWARE_VERSION"
           cmake --build build/wake --target ds5-bridge
           cp build/wake/ds5-bridge.uf2 artifacts/ds5-bridge-wake.uf2
-      - name: Build no-batt-led firmware (compile check only)
-        run: |
-          cmake -S . -B build/no-batt-led -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DPICO_SDK_PATH="$PICO_SDK_PATH" \
-            -DENABLE_BATT_LED=OFF
-          cmake --build build/no-batt-led --target ds5-bridge
 
       - name: Upload standard UF2 artifact
         uses: actions/upload-artifact@v7
@@ -128,5 +146,12 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           path: artifacts/ds5-bridge-wake.uf2
+          archive: false
+          if-no-files-found: error
+
+      - name: Upload PicoW UF2 artifact
+        uses: actions/upload-artifact@v7
+        with:
+          path: artifacts/ds5-bridge-picow.uf2
           archive: false
           if-no-files-found: error

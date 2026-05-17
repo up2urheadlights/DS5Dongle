@@ -33,6 +33,11 @@ jobs:
           ref: ${{ github.event.release.tag_name }}
           submodules: recursive
 
+      - name: Set firmware version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: printf 'FIRMWARE_VERSION=%s\n' "$RELEASE_TAG" >> "$GITHUB_ENV"
+
       - name: Prepare build dependency cache
         id: apt-cache
         run: |
@@ -82,7 +87,8 @@ jobs:
         run: |
           cmake -S . -B build/standard -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DPICO_SDK_PATH="$PICO_SDK_PATH"
+            -DPICO_SDK_PATH="$PICO_SDK_PATH" \
+            -DVERSION="$FIRMWARE_VERSION"
           cmake --build build/standard --target ds5-bridge
           mkdir -p artifacts
           cp build/standard/ds5-bridge.uf2 "artifacts/ds5-bridge-${{ github.event.release.tag_name }}.uf2"
@@ -93,7 +99,8 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DPICO_SDK_PATH="$PICO_SDK_PATH" \
             -DENABLE_SERIAL=ON \
-            -DENABLE_VERBOSE=ON
+            -DENABLE_VERBOSE=ON \
+            -DVERSION="$FIRMWARE_VERSION"
           cmake --build build/debug --target ds5-bridge
           cp build/debug/ds5-bridge.uf2 "artifacts/ds5-bridge-debug-${{ github.event.release.tag_name }}.uf2"
 

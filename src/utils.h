@@ -83,6 +83,8 @@ inline const char *opcode_to_str(const uint16_t opcode) {
             return "HCI_READ_BD_ADDR";
         case HCI_OPCODE_HCI_READ_ENCRYPTION_KEY_SIZE:
             return "HCI_READ_ENCRYPTION_KEY_SIZE";
+        case HCI_OPCODE_HCI_READ_RSSI:
+            return "HCI_READ_RSSI";
         case 0xFC01:
             return "HCI_VENDOR_0xFC01";
         default:

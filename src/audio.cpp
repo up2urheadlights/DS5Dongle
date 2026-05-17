@@ -40,22 +40,6 @@ struct audio_raw_element {
     float data[512 * 2];
 };
 
-uint8_t state_data[63] = {
-    0xfd, 0xf7, 0x0, 0x0,
-    0x7f, 0x7f, // Headphones, Speaker
-    0xff, 0x9, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
-    0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
-    0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
-    0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0xa,
-    0x7, 0x0, 0x0, 0x2, 0x1,
-    0x00,
-    0xff, 0xd7, 0x00, // RGB LED: R, G, B (Nijika Color!)✨
-};
-
-void set_state_data(const uint8_t* data, const uint8_t len) {
-    memcpy(state_data, data, len);
-}
-
 void set_headset(bool state) {
     plug_headset = state;
 }
@@ -80,6 +64,7 @@ void audio_loop() {
     const float audio_gain = mute[0] ? 0.0f : powf(10.0f, get_config().speaker_volume / 20.0f);
     const float haptics_gain = get_config().haptics_gain;
     for (int i = 0; i < nframes; i++) {
+ #if !DISABLE_SPEAKER_PROC       
         audio_buf[audio_buf_pos++] = raw[i * INPUT_CHANNELS] / 32768.0f * audio_gain;
         audio_buf[audio_buf_pos++] = raw[i * INPUT_CHANNELS + 1] / 32768.0f * audio_gain;
         if (audio_buf_pos == 512 * 2) {
@@ -93,7 +78,7 @@ void audio_loop() {
             }
             audio_buf_pos = 0;
         }
-
+#endif
         in_buf[i * 2] = static_cast<WDL_ResampleSample>(clamp(raw[i * INPUT_CHANNELS + 2] / 32768.0f * haptics_gain,
                                                               -1.0f, 1.0f));
         in_buf[i * 2 + 1] = static_cast<WDL_ResampleSample>(clamp(raw[i * INPUT_CHANNELS + 3] / 32768.0f * haptics_gain,
@@ -131,22 +116,20 @@ void audio_loop() {
         pkt[8] = buf_len; // 这 4 个字节的作用未知，调整没有效果
         pkt[9] = buf_len; // audio buffer length 只有调整这个字节生效。
         pkt[10] = packetCounter++;
-        pkt[11] = 0x10 | 0 << 6 | 1 << 7;
-        pkt[12] = 63;
-        memcpy(pkt + 13, state_data, sizeof(state_data));
-        pkt[76] = 0x12 | 0 << 6 | 1 << 7;
-        pkt[77] = SAMPLE_SIZE;
-        memcpy(pkt + 78, haptic_buf, SAMPLE_SIZE);
-        pkt[142] = (plug_headset ? 0x16 : 0x13) | 0 << 6 | 1 << 7; // Speaker: 0x13
+        pkt[11] = 0x12 | 0 << 6 | 1 << 7;
+        pkt[12] = SAMPLE_SIZE;
+        memcpy(pkt + 13, haptic_buf, SAMPLE_SIZE);
+#if !DISABLE_SPEAKER_PROC
+        pkt[77] = (plug_headset ? 0x16 : 0x13) | 0 << 6 | 1 << 7; // Speaker: 0x13
         // L Headset Mono: 0x14
         // L Headset R Speaker: 0x15
         // Headset: 0x16
-        pkt[143] = 200;
+        pkt[78] = 200;
         critical_section_enter_blocking(&opus_cs);
-        memcpy(pkt + 144, opus_buf, 200);
+        memcpy(pkt + 79, opus_buf, 200);
         critical_section_exit(&opus_cs);
-
-        bt_write(pkt, sizeof(pkt));
+#endif
+        bt_write(pkt, sizeof(pkt), true);
         haptic_buf_pos = 0;
     }
 }
@@ -156,9 +139,11 @@ void audio_init() {
     resampler.SetRates(48000, 3000);
     resampler.SetFeedMode(true);
     resampler.Prealloc(2, 24, 6);
+ #if !DISABLE_SPEAKER_PROC
     queue_init(&audio_fifo, sizeof(audio_raw_element), 2);
     critical_section_init(&opus_cs);
     multicore_launch_core1_with_stack(core1_entry, audio_core1_stack, sizeof(audio_core1_stack));
+#endif
 }
 
 static OpusEncoder *encoder;

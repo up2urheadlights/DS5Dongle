@@ -86,7 +86,7 @@ void state_update(const uint8_t *data, const uint8_t size) {
         state.VolumeHeadphones = update.VolumeHeadphones;
     }
     if (update.AllowSpeakerVolume) {
-        get_config().headset_volume = update.VolumeSpeaker;
+        get_config().speaker_volume = update.VolumeSpeaker;
         state.VolumeSpeaker = update.VolumeSpeaker;
     }
     copy_if_allowed(

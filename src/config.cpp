@@ -7,13 +7,14 @@
 #include <cmath>
 #include <cstring>
 
+#include "state_mgr.h"
 #include "utils.h"
 #include "hardware/flash.h"
 #include "hardware/sync.h"
 #include "pico/cyw43_arch.h"
 
 constexpr uint32_t CONFIG_MAGIC = 0x66ccff00;
-constexpr uint16_t CONFIG_VERSION = 1;
+constexpr uint16_t CONFIG_VERSION = 2;
 constexpr uint32_t CONFIG_FLASH_OFFSET = PICO_FLASH_SIZE_BYTES - FLASH_SECTOR_SIZE;
 static Config config{};
 bool is_dse = false;
@@ -51,9 +52,17 @@ void config_valid() {
         body->haptics_gain = 1.0f;
         printf("[Config] Haptics Gain value is invalid\n");
     }
-    if (std::isnan(body->speaker_volume) || body->speaker_volume < -100 || body->speaker_volume > 0) {
-        body->speaker_volume = -100;
+    if (body->speaker_volume < 0 || body->speaker_volume > 127) {
+        body->speaker_volume = 100;
         printf("[Config] Speaker Volume is invalid\n");
+    }
+    if (body->headset_volume < 0 || body->speaker_volume > 127) {
+        body->headset_volume = 100;
+        printf("[Config] Headset Volume is invalid\n");
+    }
+    if (body->sync_spk_headset_volume > 1) {
+        body->sync_spk_headset_volume = 0;
+        printf("[Config] sync_spk_headset_volume is invalid\n");
     }
     if (body->inactive_time < 5 || body->inactive_time > 60) {
         body->inactive_time = 30;
@@ -113,7 +122,7 @@ bool config_save() {
     return false;
 }
 
-const Config_body& get_config() {
+Config_body& get_config() {
     return config.body;
 }
 
@@ -126,6 +135,7 @@ void set_config(const uint8_t *new_config, const uint16_t len) {
     }else {
         cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, true);
     }
+    set_volume(config.body.speaker_volume,config.body.headset_volume);
 }
 
 void set_config(const Config_body &new_config) {

@@ -453,6 +453,7 @@ static void l2cap_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t 
 
                     init_feature();
                     // 初始化手柄状态
+                    state_init();
                     uint8_t report32[142]{};
                     report32[0] = 0x32;
                     report32[1] = 0x10; // reportSeqCounter

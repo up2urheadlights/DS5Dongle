@@ -406,6 +406,7 @@ struct __attribute__((packed)) SetStateData { // 47
 /*44  */ uint8_t LedRed;
 /*45  */ uint8_t LedGreen;
 /*46  */ uint8_t LedBlue;
+    uint8_t reserved[16];
 // Structure ends here though on BT there is padding and a CRC, see ReportOut31
 };
 

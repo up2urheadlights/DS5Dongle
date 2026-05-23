@@ -10,7 +10,9 @@
 struct __attribute__((packed)) Config_body {
     uint8_t config_version; // Config Version
     float haptics_gain; // [1.0,2.0]
-    float speaker_volume; // [-100,0]
+    uint8_t speaker_volume; // [0,127]
+    uint8_t headset_volume; // [0,127] // max 0x7f
+    uint8_t sync_spk_headset_volume; // bool: 0 disable,1 enable
     uint8_t inactive_time; // [5,60] min
     uint8_t disable_inactive_disconnect; // bool: 0 disable,1 enable
     uint8_t disable_pico_led; // bool
@@ -30,7 +32,7 @@ struct __attribute__((packed)) Config {
 void config_default();
 void config_load();
 bool config_save();
-const Config_body& get_config();
+Config_body& get_config();
 void set_config(const uint8_t *new_config, const uint16_t len);
 void config_valid();
 void set_config(const Config_body &new_config);

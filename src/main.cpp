@@ -324,6 +324,7 @@ int main() {
 #if ENABLE_BATT_LED
         battery_led_tick();
 #endif
+        bt_bootsel_check();
         bt_inquiring_led();
         dse_task();
     }

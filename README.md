@@ -20,6 +20,11 @@ This project enables the Raspberry Pi Pico2W (or other compatible board, e.g. th
 - 📡 Wireless Bluetooth bridging
 - ⚡ Runs at the stock 150 MHz clock — no overclock required
 
+> **Microphone note:** the controller mic shows up as a USB audio input
+> (named "Headset"). After selecting it as your recording device, raise its
+> input/capture level in your OS — Windows in particular often defaults it to 0
+> (or very low), which makes the mic seem dead even though it's working.
+
 ## Getting Started
 
 ### Get the firmware

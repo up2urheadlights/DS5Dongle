@@ -165,6 +165,70 @@ add_custom_command(TARGET wdl_resampler POST_BUILD
         $<TARGET_FILE:wdl_resampler>
     COMMENT "Phase A.2: relocating WDL_Resampler hot-path methods to .time_critical.*"
 )
+
+# Phase B.2: Move Tier-1 BT/USB hot-path functions to RAM via .time_critical
+# sections. These live in pristine SDK/submodule sources (btstack, cyw43-driver,
+# tinyusb) compiled directly into ds5-bridge, so they can't be annotated with
+# __not_in_flash_func at the source. Since -ffunction-sections is already on,
+# every function has its own .text.<name> section; we rename just the per-packet
+# hot functions to .time_critical.<name> on the compiled object files in a
+# PRE_LINK step (after compile, before link). The Pico SDK linker places
+# .time_critical.* in RAM (LMA flash, VMA RAM). objcopy silently skips a section
+# that is absent, so this stays idempotent across incremental relinks.
+# Object paths mirror the absolute source path under the target's .dir; every
+# source here lives under PICO_SDK_PATH.
+set(_b2_objdir ${CMAKE_BINARY_DIR}/CMakeFiles/ds5-bridge.dir${PICO_SDK_PATH})
+add_custom_command(TARGET ds5-bridge PRE_LINK
+    # btstack: central HCI packet dispatch (runs for every HCI event / ACL packet)
+    COMMAND ${CMAKE_OBJCOPY}
+        --rename-section .text.packet_handler=.time_critical.bt_packet_handler
+        ${_b2_objdir}/lib/btstack/src/hci.c.o
+    # btstack: inbound L2CAP/ACL demux (carries the audio media channel)
+    COMMAND ${CMAKE_OBJCOPY}
+        --rename-section .text.l2cap_acl_handler=.time_critical.l2cap_acl_handler
+        ${_b2_objdir}/lib/btstack/src/l2cap.c.o
+    # tinyusb: USB audio data is copied through these FIFOs
+    COMMAND ${CMAKE_OBJCOPY}
+        --rename-section .text.tu_fifo_read=.time_critical.tu_fifo_read
+        --rename-section .text.tu_fifo_read_n=.time_critical.tu_fifo_read_n
+        --rename-section .text.tu_fifo_write=.time_critical.tu_fifo_write
+        --rename-section .text.tu_fifo_write_n=.time_critical.tu_fifo_write_n
+        --rename-section .text.tu_fifo_count=.time_critical.tu_fifo_count
+        ${_b2_objdir}/lib/tinyusb/src/common/tusb_fifo.c.o
+    # cyw43: PIO-SPI transport to the BT/WiFi chip (every byte to/from the radio)
+    COMMAND ${CMAKE_OBJCOPY}
+        --rename-section .text.cyw43_spi_transfer=.time_critical.cyw43_spi_transfer
+        --rename-section .text.cyw43_read_bytes=.time_critical.cyw43_read_bytes
+        --rename-section .text.cyw43_write_bytes=.time_critical.cyw43_write_bytes
+        --rename-section .text.cyw43_read_reg_u32=.time_critical.cyw43_read_reg_u32
+        --rename-section .text.cyw43_read_reg_u16=.time_critical.cyw43_read_reg_u16
+        --rename-section .text.cyw43_read_reg_u8=.time_critical.cyw43_read_reg_u8
+        --rename-section .text.cyw43_write_reg_u32=.time_critical.cyw43_write_reg_u32
+        --rename-section .text.cyw43_write_reg_u16=.time_critical.cyw43_write_reg_u16
+        --rename-section .text.cyw43_write_reg_u8=.time_critical.cyw43_write_reg_u8
+        --rename-section .text.read_reg_u32_swap=.time_critical.read_reg_u32_swap
+        --rename-section .text.write_reg_u32_swap=.time_critical.write_reg_u32_swap
+        --rename-section .text.ns_delay.constprop.0=.time_critical.cyw43_ns_delay
+        ${_b2_objdir}/src/rp2_common/pico_cyw43_driver/cyw43_bus_pio_spi.c.o
+    # cyw43: SDPCM packet pump (parses/sends radio packets, BT work check)
+    COMMAND ${CMAKE_OBJCOPY}
+        --rename-section .text.cyw43_ll_sdpcm_poll_device=.time_critical.cyw43_ll_sdpcm_poll_device
+        --rename-section .text.cyw43_ll_process_packets=.time_critical.cyw43_ll_process_packets
+        --rename-section .text.cyw43_sdpcm_send_common=.time_critical.cyw43_sdpcm_send_common
+        --rename-section .text.cyw43_do_ioctl.part.0=.time_critical.cyw43_do_ioctl
+        --rename-section .text.cyw43_ll_bt_has_work=.time_critical.cyw43_ll_bt_has_work
+        --rename-section .text.cyw43_ll_parse_async_event=.time_critical.cyw43_ll_parse_async_event
+        ${_b2_objdir}/lib/cyw43-driver/src/cyw43_ll.c.o
+    # cyw43: poll loop + BT HCI read/write over the shared bus
+    COMMAND ${CMAKE_OBJCOPY}
+        --rename-section .text.cyw43_poll_func=.time_critical.cyw43_poll_func
+        --rename-section .text.cyw43_bluetooth_hci_read=.time_critical.cyw43_bluetooth_hci_read
+        --rename-section .text.cyw43_bluetooth_hci_write=.time_critical.cyw43_bluetooth_hci_write
+        ${_b2_objdir}/lib/cyw43-driver/src/cyw43_ctrl.c.o
+    COMMENT "Phase B.2: relocating Tier-1 BT/USB hot functions to .time_critical.* (RAM)"
+    VERBATIM
+)
+
 target_compile_options(ds5-bridge PRIVATE -fsigned-char)
 target_compile_definitions(wdl_resampler PRIVATE
         WDL_RESAMPLE_TYPE=float

@@ -355,6 +355,21 @@ void bt_inquiring_led() {
     }
 }
 
+// True if BTstack already has a stored controller link key. When we know a
+// controller we skip the boot inquiry and just wait on page scan -- a paired
+// controller reconnects on its own (gap_connectable_control). No stored key
+// (fresh dongle, or after a BOOTSEL-hold clear-all) -> inquire to pair one.
+static bool bt_has_stored_link_key() {
+    btstack_link_key_iterator_t it;
+    if (!gap_link_key_iterator_init(&it)) return false;
+    bd_addr_t addr;
+    link_key_t key;
+    link_key_type_t type;
+    const bool has_key = gap_link_key_iterator_get_next(&it, addr, key, &type);
+    gap_link_key_iterator_done(&it);
+    return has_key;
+}
+
 static void __not_in_flash_func(hci_packet_handler)(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size) {
     (void) channel;
 
@@ -365,10 +380,19 @@ static void __not_in_flash_func(hci_packet_handler)(uint8_t packet_type, uint16_
             const uint8_t state = btstack_event_state_get_state(packet);
             printf("[BT] State: %u\n", state);
             if (state == HCI_STATE_WORKING) {
-                printf("[BT] Stack ready, start inquiry\n");
                 bt_blacklist_load();
-                gap_inquiry_start(30);
-                bt_inquiring = true;
+                // Only inquire on boot when we don't already know a controller.
+                // With a stored link key, the paired controller reconnects on its
+                // own via page scan, so stay dark and skip the inquiry blink. Pair
+                // a different controller with the BOOTSEL single-click; a clear-all
+                // (BOOTSEL hold) wipes the keys so the next boot scans again.
+                if (bt_has_stored_link_key()) {
+                    printf("[BT] Stack ready, stored controller -> page scan, no inquiry\n");
+                } else {
+                    printf("[BT] Stack ready, no stored controller -> start inquiry\n");
+                    gap_inquiry_start(30);
+                    bt_inquiring = true;
+                }
             }
             break;
         }

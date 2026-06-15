@@ -605,8 +605,13 @@ static void __not_in_flash_func(hci_packet_handler)(uint8_t packet_type, uint16_
             battery_led_on_disconnect();
 #endif
             printf("[HCI] Disconnected reason=0x%02X\n", reason);
-            gap_inquiry_start(30);
-            bt_inquiring = true;
+            // Reverts #150: do NOT auto-restart inquiry on disconnect. Page scan
+            // stays enabled (gap_connectable_control above), so a previously-paired
+            // controller reconnects on its own when powered back on. Discovering a
+            // *different* controller is an explicit action (BOOTSEL single-click).
+            // This keeps the LED dark after every power-off / sleep / timeout
+            // instead of blinking the 30 s inquiry.
+            bt_inquiring = false;
             break;
         }
 

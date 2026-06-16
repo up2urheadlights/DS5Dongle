@@ -60,13 +60,13 @@ timeout, sleep, restart, or dongle reboot therefore no longer kicks off a
 
 ### BOOTSEL button: switch, reboot, or clear controllers
 
-While the firmware is running, the Pico's **BOOTSEL button** doubles as a
-controller and reset control — no unplugging or re-flashing needed:
+While the firmware is running, the Pico's **BOOTSEL button** also manages paired
+controllers and resets the dongle — no unplugging or re-flashing needed:
 
 - **Short press (click):**
   - If a controller is connected, the current one is disconnected (its pairing is
-    kept, so it can reconnect later). Use this to free the dongle for a different
-    already-paired controller.
+    kept, so it can reconnect later). Use this to free the dongle to pair a
+    previously unknown controller.
   - If nothing is connected, a 30-second scan starts to pair a new controller.
     Put the DualSense into pairing mode (hold **PS + Create/Share** until the
     light bar flashes) while the scan runs.

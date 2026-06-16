@@ -355,10 +355,7 @@ void bt_inquiring_led() {
     }
 }
 
-// True if BTstack already has a stored controller link key. When we know a
-// controller we skip the boot inquiry and just wait on page scan -- a paired
-// controller reconnects on its own (gap_connectable_control). No stored key
-// (fresh dongle, or after a BOOTSEL-hold clear-all) -> inquire to pair one.
+// True if BTstack has at least one stored controller link key.
 static bool bt_has_stored_link_key() {
     btstack_link_key_iterator_t it;
     if (!gap_link_key_iterator_init(&it)) return false;
@@ -381,11 +378,8 @@ static void __not_in_flash_func(hci_packet_handler)(uint8_t packet_type, uint16_
             printf("[BT] State: %u\n", state);
             if (state == HCI_STATE_WORKING) {
                 bt_blacklist_load();
-                // Only inquire on boot when we don't already know a controller.
-                // With a stored link key, the paired controller reconnects on its
-                // own via page scan, so stay dark and skip the inquiry blink. Pair
-                // a different controller with the BOOTSEL single-click; a clear-all
-                // (BOOTSEL hold) wipes the keys so the next boot scans again.
+                // Only inquire on boot when no controller is paired; a stored
+                // controller reconnects on its own via page scan.
                 if (bt_has_stored_link_key()) {
                     printf("[BT] Stack ready, stored controller -> page scan, no inquiry\n");
                 } else {
@@ -629,12 +623,9 @@ static void __not_in_flash_func(hci_packet_handler)(uint8_t packet_type, uint16_
             battery_led_on_disconnect();
 #endif
             printf("[HCI] Disconnected reason=0x%02X\n", reason);
-            // Reverts #150: do NOT auto-restart inquiry on disconnect. Page scan
-            // stays enabled (gap_connectable_control above), so a previously-paired
-            // controller reconnects on its own when powered back on. Discovering a
-            // *different* controller is an explicit action (BOOTSEL single-click).
-            // This keeps the LED dark after every power-off / sleep / timeout
-            // instead of blinking the 30 s inquiry.
+            // No inquiry on disconnect: page scan (above) handles reconnect of a
+            // paired controller; discovering a new one is the explicit BOOTSEL
+            // single-click.
             bt_inquiring = false;
             break;
         }

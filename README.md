@@ -64,12 +64,11 @@ While the firmware is running, the Pico's **BOOTSEL button** also manages paired
 controllers and resets the dongle — no unplugging or re-flashing needed:
 
 - **Short press (click):**
-  - If a controller is connected, the current one is disconnected (its pairing is
-    kept, so it can reconnect later). Use this to free the dongle to pair a
-    previously unknown controller.
-  - If nothing is connected, a 30-second scan starts to pair a new controller.
-    Put the DualSense into pairing mode (hold **PS + Create/Share** until the
-    light bar flashes) while the scan runs.
+  - **While a controller is connected** — disconnects it (pairing kept). The
+    dongle goes quiet and stays connectable, so a different already-paired
+    controller can take over.
+  - **While nothing is connected** — starts a 30-second pairing scan (put the new
+    controller into **PS + Create/Share** mode while the LED blinks).
 - **Double click:** **Reboot the Pico** — a normal firmware restart that drops the
   current connection and recovers from a transient glitch. It re-enters pairing
   inquiry **only if no controller is paired**; with a controller already in memory

@@ -581,11 +581,11 @@ static void __not_in_flash_func(hci_packet_handler)(uint8_t packet_type, uint16_
 
         case HCI_EVENT_DISCONNECTION_COMPLETE: {
 #if !ENABLE_SERIAL
-            // Hide the USB device whenever no controller is paired (upstream
-            // behavior) -- UNLESS wake is enabled at runtime, where we must stay on
-            // the bus across controller power-cycles so tud_suspend_cb can later fire
-            // and tud_remote_wakeup() can signal a wake when the controller returns.
-            if (!get_config().enable_wake) {
+            // Hide the USB device when no controller is paired (upstream behavior), EXCEPT when
+            // wake is on (stay on the bus so a returning controller can signal a host wake) or
+            // while the host is suspended -- hiding then re-showing re-enumerates, and a USB
+            // re-connect wakes a sleeping host. Defer the hide until the host is awake.
+            if (!get_config().enable_wake && !tud_suspended()) {
                 tud_disconnect();
             }
 #endif
@@ -657,14 +657,15 @@ static void __not_in_flash_func(l2cap_packet_handler)(uint8_t packet_type, uint1
                     // reads are gated until the snapshot is prepared.
                     dse_on_connect();
 #if !ENABLE_SERIAL
-                    tud_connect();
+                    // don't re-enumerate while the host is suspended -- it would wake a sleeping host
+                    if (!tud_suspended()) tud_connect();
 #endif
                 } else if (packet[0] == 0x02) {
                     printf("Connected DS5 Controller\n");
                     check_dse = false;
                     is_dse = false;
 #if !ENABLE_SERIAL
-                    tud_connect();
+                    if (!tud_suspended()) tud_connect();
 #endif
                 }
             }

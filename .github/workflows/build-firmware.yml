@@ -298,6 +298,12 @@ jobs:
       contents: write
 
     steps:
+      - name: Checkout release source
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ inputs.repo == '' && github.repository || inputs.repo }}
+          ref: ${{ inputs.ref }}
+
       - name: Download UF2 artifacts
         uses: actions/download-artifact@v8
         with:
@@ -321,7 +327,14 @@ jobs:
             echo "Missing standard firmware: $standard" >&2
             exit 1
           fi
-          cp "$standard" release-assets/ds5-bridge.uf2
+          cp "$standard" "release-assets/ds5-bridge${ASSET_SUFFIX}.uf2"
+
+          config_tool="tools/config_tool.py"
+          if [ ! -f "$config_tool" ]; then
+            echo "Missing config tool: $config_tool" >&2
+            exit 1
+          fi
+          cp "$config_tool" release-assets/config_tool.py
 
           shopt -s nullglob
           for uf2 in artifacts/*.uf2; do
@@ -338,7 +351,7 @@ jobs:
             (cd other-boards && zip -9 -q "../release-assets/other board.zip" ./*.uf2)
           fi
 
-      - name: Remove legacy individual UF2 release assets
+      - name: Remove stale UF2 release assets
         env:
           ASSET_SUFFIX: ${{ inputs.asset_suffix }}
           GH_REPO: ${{ github.repository }}
@@ -348,14 +361,11 @@ jobs:
           set -euo pipefail
 
           for name in \
-            "ds5-bridge${ASSET_SUFFIX}.uf2" \
+            "ds5-bridge.uf2" \
             "ds5-bridge-debug${ASSET_SUFFIX}.uf2" \
             "ds5-bridge-picow${ASSET_SUFFIX}.uf2" \
             "ds5-bridge-waveshare${ASSET_SUFFIX}.uf2"
           do
-            if [ "$name" = "ds5-bridge.uf2" ]; then
-              continue
-            fi
             gh release delete-asset "$UPLOAD_TAG" "$name" \
               --repo "$GH_REPO" --yes 2>/dev/null || true
           done

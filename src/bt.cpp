@@ -239,6 +239,18 @@ static bool bt_blacklist_contains(bd_addr_t addr) {
     return false;
 }
 
+// Add an address to the blacklist if not already present (de-duped, capped at
+// NVM_NUM_LINK_KEYS). The BOOTSEL-hold clear uses this so repeated holds
+// accumulate rather than rebuild (see bt_bootsel_hold_action()).
+static void bt_blacklist_add_unique(bd_addr_t addr) {
+    if (bt_cleared_addrs_count >= NVM_NUM_LINK_KEYS) return;
+    for (int i = 0; i < bt_cleared_addrs_count; i++) {
+        if (bd_addr_cmp(addr, bt_cleared_addrs[i]) == 0) return; // already listed
+    }
+    bd_addr_copy(bt_cleared_addrs[bt_cleared_addrs_count++], addr);
+    printf("[BLACKLIST] Added %s\n", bd_addr_to_str(addr));
+}
+
 // Remove the given address from the blacklist (if present). Defers the
 // flash persist to the main loop via bt_blacklist_dirty so the L2CAP HID
 // open hot path stays fast (audio + HID init must not block on flash).
@@ -296,38 +308,26 @@ void bt_bootsel_click_action() {
 void bt_bootsel_hold_action() {
     printf("[BT] BOOTSEL held - clearing all pairings\n");
 
-    // Reset and rebuild blacklist from currently stored keys
-    bt_cleared_addrs_count = 0;
+    // Additive + de-duped: merge the currently-stored controllers into the
+    // EXISTING blacklist. Do NOT reset the list first -- on a second hold no link
+    // keys remain, so a rebuild would produce an empty list, and
+    // bt_blacklist_persist() delete_tag's an empty list, silently un-blacklisting
+    // the controller that was just cleared.
     btstack_link_key_iterator_t it;
     if (gap_link_key_iterator_init(&it)) {
         bd_addr_t addr;
         link_key_t key;
         link_key_type_t type;
-        while (gap_link_key_iterator_get_next(&it, addr, key, &type) &&
-               bt_cleared_addrs_count < NVM_NUM_LINK_KEYS) {
-            bd_addr_copy(bt_cleared_addrs[bt_cleared_addrs_count++], addr);
-            printf("[BLACKLIST] From stored key: %s\n", bd_addr_to_str(addr));
+        while (gap_link_key_iterator_get_next(&it, addr, key, &type)) {
+            bt_blacklist_add_unique(addr);
         }
         gap_link_key_iterator_done(&it);
     }
 
-    // Belt + suspenders: if connected, add the live controller's MAC too,
-    // in case the iterator missed it (e.g. key not yet persisted to flash).
-    if (hid_interrupt_cid != 0 && bt_cleared_addrs_count < NVM_NUM_LINK_KEYS) {
-        bool already_present = false;
-        for (int i = 0; i < bt_cleared_addrs_count; i++) {
-            if (bd_addr_cmp(current_device_addr, bt_cleared_addrs[i]) == 0) {
-                already_present = true;
-                break;
-            }
-        }
-        if (!already_present) {
-            bd_addr_copy(bt_cleared_addrs[bt_cleared_addrs_count++], current_device_addr);
-            printf("[BLACKLIST] From live connection: %s\n", bd_addr_to_str(current_device_addr));
-        }
-    }
-
+    // Belt + suspenders: if connected, blacklist the live controller's MAC too
+    // (its key may not be persisted yet), then drop the link.
     if (hid_interrupt_cid != 0) {
+        bt_blacklist_add_unique(current_device_addr);
         bt_disconnect();
     }
     gap_delete_all_link_keys();

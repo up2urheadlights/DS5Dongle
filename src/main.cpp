@@ -16,6 +16,7 @@
 #include "wake.h"
 #ifdef ENABLE_WAKE_HID
 #include "ps_shortcut.h"
+#include "xinput.h"
 #endif
 #include "hardware/clocks.h"
 #include "hardware/vreg.h"
@@ -129,6 +130,7 @@ void __not_in_flash_func(on_bt_data)(CHANNEL_TYPE channel, uint8_t *data, uint16
         wake_on_bt_input(data + 3, len - 3);
         #ifdef ENABLE_WAKE_HID
         ps_shortcut_tick(data + 3, len - 3);
+        xinput_tick(data + 3, len - 3);
         #endif
 
         if (get_config().polling_rate_mode != 2) {

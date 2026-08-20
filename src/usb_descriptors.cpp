@@ -27,6 +27,8 @@
 #include "tusb.h"
 #include "config.h"
 
+#include <cstring>
+
 #ifndef ENABLE_SERIAL
 #define ENABLE_SERIAL 0
 #endif
@@ -49,6 +51,7 @@ enum {
 #endif
 #ifdef ENABLE_WAKE_HID
     ITF_NUM_HID_KBD,
+    ITF_NUM_XINPUT,
 #endif
     ITF_NUM_TOTAL,
 
@@ -67,7 +70,16 @@ enum {
 #else
         0,
 #endif
+    // XInput interface adds 40 bytes:
+    //   9 (interface) + 17 (Xbox vendor) + 7 + 7 (two endpoints) = 40
+    CONFIG_DESC_LEN_XINPUT =
+#ifdef ENABLE_WAKE_HID
+        40,
+#else
+        0,
+#endif
     CONFIG_DESC_LEN_TOTAL = CONFIG_DESC_LEN_BASE + CONFIG_DESC_LEN_WAKE_KBD
+        + CONFIG_DESC_LEN_XINPUT
 #if ENABLE_SERIAL
         + TUD_CDC_DESC_LEN
 #endif
@@ -127,9 +139,18 @@ tusb_desc_device_t desc_device =
 uint8_t const *tud_descriptor_device_cb(void) {
     desc_device.idProduct = ds_mode() ? 0x0CE6 : 0x0DF2;
     desc_device.iSerialNumber = get_config().enable_usb_sn ? 0x03 : 0x00;
-    // USB 2.1 (so the host requests the BOS / MS OS 2.0 selective-suspend opt-in)
-    // only when wake is enabled; plain USB 2.0 otherwise.
-    desc_device.bcdUSB = get_config().enable_wake ? 0x0210 : 0x0200;
+    // USB 2.1 is what makes the host fetch BOS, the only route by which it
+    // learns the MS OS 2.0 set exists. Needed by both features that set carries.
+    const bool ms_os = get_config().enable_wake || get_config().ps_shortcut_enabled;
+    desc_device.bcdUSB = ms_os ? 0x0210 : 0x0200;
+
+    // Windows records whether a device has MS OS descriptors under
+    // usbflags\<VID><PID><bcdDevice> and does not re-query. Any host that has
+    // seen a real DualSense already holds a "none" verdict for revision 0100,
+    // which would keep the XInput function from ever appearing. A distinct
+    // revision while it is enabled lands on a fresh entry instead.
+    desc_device.bcdDevice = get_config().ps_shortcut_enabled ? 0x0101 : 0x0100;
+
     return reinterpret_cast<uint8_t const *>(&desc_device);
 }
 
@@ -438,8 +459,50 @@ uint8_t descriptor_configuration[] = {
     0x03, // bmAttributes: Interrupt
     0x08, 0x00, // wMaxPacketSize: 8 (boot keyboard report)
     0x0A, // bInterval: 10ms
+
+    // --- INTERFACE DESCRIPTOR (XInput / Xbox 360 compatible) ---
+    // Bound by xusb22.sys through the MS OS 2.0 compatible ID "XUSB10" declared
+    // below, which is matched per function -- so VID/PID stays Sony's and the
+    // HID and audio interfaces are unaffected.
+    0x09, // bLength
+    0x04, // bDescriptorType (INTERFACE)
+    ITF_NUM_XINPUT, // bInterfaceNumber
+    0x00, // bAlternateSetting: 0
+    0x02, // bNumEndpoints: 2 (IN + OUT)
+    0xFF, // bInterfaceClass: vendor specific
+    0x5D, // bInterfaceSubClass: Xbox 360 controller
+    0x01, // bInterfaceProtocol
+    0x00, // iInterface
+
+    // Xbox 360 vendor descriptor, verbatim from a retail wired pad. Bytes 6 and
+    // 13 are the IN and OUT endpoint addresses, hence EP 0x81/0x02 -- the
+    // canonical pair, and free in every build here.
+    0x11, 0x21, 0x00, 0x01, 0x01, 0x25, 0x81, 0x14, 0x00, 0x00,
+    0x00, 0x00, 0x13, 0x02, 0x08, 0x00, 0x00,
+
+    // Endpoint Descriptor (XInput IN: EP1)
+    0x07, // bLength
+    0x05, // bDescriptorType (ENDPOINT)
+    0x81, // bEndpointAddress: IN EP1
+    0x03, // bmAttributes: Interrupt
+    0x20, 0x00, // wMaxPacketSize: 32
+    0x04, // bInterval: 4ms
+
+    // Endpoint Descriptor (XInput OUT: EP2)
+    0x07, // bLength
+    0x05, // bDescriptorType (ENDPOINT)
+    0x02, // bEndpointAddress: OUT EP2
+    0x03, // bmAttributes: Interrupt
+    0x20, 0x00, // wMaxPacketSize: 32
+    0x08, // bInterval: 8ms
 #endif
 };
+
+// tud_descriptor_configuration_cb() derives its length from these constants and
+// truncates by the same amounts, so drift would advertise a length the
+// descriptor does not have.
+static_assert(sizeof(descriptor_configuration) == CONFIG_DESC_LEN_TOTAL,
+              "config descriptor block sizes are out of step with the array");
 
 // Invoked when received GET CONFIGURATION DESCRIPTOR
 // Application return pointer to descriptor
@@ -471,13 +534,25 @@ uint8_t const *tud_descriptor_configuration_cb(uint8_t index) {
     // on, and include the keyboard interface (the LAST descriptor block) only when wake
     // OR the Game Bar shortcut is on. With both off this is byte-identical to the base.
     const bool wake = get_config().enable_wake;
-    const bool kbd = wake || get_config().ps_shortcut_enabled;
+    const bool xinput = get_config().ps_shortcut_enabled != 0;
+    const bool kbd = wake || xinput;
     descriptor_configuration[7] = wake ? 0xE0 : 0xC0; // bmAttributes (REMOTE_WAKEUP bit)
-    const uint16_t total = kbd ? CONFIG_DESC_LEN_TOTAL
-                               : (uint16_t) (CONFIG_DESC_LEN_TOTAL - CONFIG_DESC_LEN_WAKE_KBD);
-    descriptor_configuration[2] = (uint8_t) (total & 0xFF);                  // wTotalLength lo
-    descriptor_configuration[3] = (uint8_t) (total >> 8);                    // wTotalLength hi
-    descriptor_configuration[4] = kbd ? ITF_NUM_TOTAL : (ITF_NUM_TOTAL - 1); // bNumInterfaces
+
+    // Tail order is [base][keyboard][xinput] and xinput implies kbd, so what is
+    // dropped is always a suffix.
+    uint16_t total = CONFIG_DESC_LEN_TOTAL;
+    uint8_t itf_count = ITF_NUM_TOTAL;
+    if (!xinput) {
+        total -= CONFIG_DESC_LEN_XINPUT;
+        itf_count--;
+    }
+    if (!kbd) {
+        total -= CONFIG_DESC_LEN_WAKE_KBD;
+        itf_count--;
+    }
+    descriptor_configuration[2] = (uint8_t) (total & 0xFF); // wTotalLength lo
+    descriptor_configuration[3] = (uint8_t) (total >> 8);   // wTotalLength hi
+    descriptor_configuration[4] = itf_count;                // bNumInterfaces
     return descriptor_configuration;
 }
 
@@ -1005,42 +1080,50 @@ uint16_t const *tud_descriptor_string_cb(uint8_t index, uint16_t langid) {
 
 #define MS_OS_20_VENDOR_CODE 0x01
 
-// Total length of the MS OS 2.0 descriptor set:
-//   Set Header (10) + Config Subset (8) + Function Subset (8) +
-//   Registry Property Feature (10 fixed + 48 name + 4 data = 62) = 88 bytes.
-// Used in BOS platform capability descriptor; verified by static_assert below.
-#define MS_OS_20_DESC_LEN    88
+// Assembled at request time from three fragments, because the two features it
+// can carry are switched independently and neither is a suffix of the other:
+//
+//   header   Set Header + Configuration Subset          always
+//   audio    Function Subset + Registry Property        when wake is on
+//   xinput   Function Subset + Compatible ID            when Game Bar is on
+//
+// Windows caches the set per VID/PID/bcdDevice and does not re-query; see
+// tud_descriptor_device_cb().
+#define MS_OS_20_LEN_HEADER  18
+#define MS_OS_20_LEN_AUDIO   70
+#define MS_OS_20_LEN_XINPUT  28
+#define MS_OS_20_DESC_LEN    (MS_OS_20_LEN_HEADER + MS_OS_20_LEN_AUDIO + MS_OS_20_LEN_XINPUT)
 
 #define BOS_TOTAL_LEN        (TUD_BOS_DESC_LEN + TUD_BOS_MICROSOFT_OS_DESC_LEN)
 
-uint8_t const desc_bos[] = {
+// Offset of wMSOSDescriptorSetTotalLength inside the platform capability:
+// the BOS header, then 4 bytes of capability header + 16 UUID + 4 version.
+#define BOS_MS_OS_20_LEN_OFFSET (TUD_BOS_DESC_LEN + 4 + 16 + 4)
+
+// Not const: the advertised set length is patched to match what we assemble.
+uint8_t desc_bos[] = {
     // BOS header
     TUD_BOS_DESCRIPTOR(BOS_TOTAL_LEN, 1),
     // Platform capability: MS OS 2.0
     TUD_BOS_MS_OS_20_DESCRIPTOR(MS_OS_20_DESC_LEN, MS_OS_20_VENDOR_CODE)
 };
 
-uint8_t const *tud_descriptor_bos_cb(void) {
-    // BOS carries the MS OS 2.0 selective-suspend opt-in, only meaningful for wake.
-    // When wake is off the device is USB 2.0 and the host won't ask -- guard anyway.
-    if (!get_config().enable_wake) return nullptr;
-    return desc_bos;
-}
-
-uint8_t const desc_ms_os_20[] = {
+static uint8_t const ms_os_20_header[MS_OS_20_LEN_HEADER] = {
     // --- Set Header (10 bytes) ---
     U16_TO_U8S_LE(0x000A),                                    // wLength
     U16_TO_U8S_LE(MS_OS_20_SET_HEADER_DESCRIPTOR),            // wDescriptorType
     U32_TO_U8S_LE(0x06030000),                                // dwWindowsVersion = Win 8.1+
-    U16_TO_U8S_LE(MS_OS_20_DESC_LEN),                         // wTotalLength
+    U16_TO_U8S_LE(0x0000),                                    // wTotalLength (patched)
 
     // --- Configuration Subset (8 bytes) ---
     U16_TO_U8S_LE(0x0008),                                    // wLength
     U16_TO_U8S_LE(MS_OS_20_SUBSET_HEADER_CONFIGURATION),      // wDescriptorType
     0x00,                                                     // bConfigurationValue (config index, 0)
     0x00,                                                     // bReserved
-    U16_TO_U8S_LE(MS_OS_20_DESC_LEN - 0x0A),                  // wTotalLength of this subset
+    U16_TO_U8S_LE(0x0000),                                    // wTotalLength of subset (patched)
+};
 
+static uint8_t const ms_os_20_audio[MS_OS_20_LEN_AUDIO] = {
     // --- Function Subset for the Audio function (8 bytes) ---
     // Audio Control is interface 0; AudioStreaming OUT/IN are 1/2 -- this
     // subset covers all three because they belong to the same function.
@@ -1048,7 +1131,7 @@ uint8_t const desc_ms_os_20[] = {
     U16_TO_U8S_LE(MS_OS_20_SUBSET_HEADER_FUNCTION),           // wDescriptorType
     0x00,                                                     // bFirstInterface (audio control)
     0x00,                                                     // bReserved
-    U16_TO_U8S_LE(MS_OS_20_DESC_LEN - 0x0A - 0x08),           // wSubsetLength
+    U16_TO_U8S_LE(MS_OS_20_LEN_AUDIO),                        // wSubsetLength
 
     // --- Feature: Registry Property "SelectiveSuspendEnabled" = 1 (62 bytes) ---
     U16_TO_U8S_LE(0x003E),                                    // wLength = 62
@@ -1062,18 +1145,73 @@ uint8_t const desc_ms_os_20[] = {
     U16_TO_U8S_LE(0x0004),                                    // wPropertyDataLength = 4 bytes
     U32_TO_U8S_LE(0x00000001),                                // PropertyData = 1 (enabled)
 };
-TU_VERIFY_STATIC(sizeof(desc_ms_os_20) == MS_OS_20_DESC_LEN, "MS OS 2.0 descriptor length mismatch");
+
+static uint8_t const ms_os_20_xinput[MS_OS_20_LEN_XINPUT] = {
+    // --- Function Subset for the XInput function (8 bytes) ---
+    U16_TO_U8S_LE(0x0008),                                    // wLength
+    U16_TO_U8S_LE(MS_OS_20_SUBSET_HEADER_FUNCTION),           // wDescriptorType
+    ITF_NUM_XINPUT,                                           // bFirstInterface
+    0x00,                                                     // bReserved
+    U16_TO_U8S_LE(MS_OS_20_LEN_XINPUT),                       // wSubsetLength
+
+    // --- Feature: Compatible ID "XUSB10" (20 bytes) ---
+    // Windows synthesises USB\MS_COMP_XUSB10 from this, which xusb22.inf matches.
+    U16_TO_U8S_LE(0x0014),                                    // wLength = 20
+    U16_TO_U8S_LE(MS_OS_20_FEATURE_COMPATBLE_ID),             // wDescriptorType (TinyUSB spells it thus)
+    'X','U','S','B','1','0', 0x00, 0x00,                      // CompatibleID
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,                  // SubCompatibleID
+};
+
+static uint8_t ms_os_20_buf[MS_OS_20_DESC_LEN];
+
+// Assemble the set for the current configuration, patch the two length fields
+// and the BOS capability to match, and return the assembled length.
+static uint16_t ms_os_20_build() {
+    uint16_t len = MS_OS_20_LEN_HEADER;
+    memcpy(ms_os_20_buf, ms_os_20_header, MS_OS_20_LEN_HEADER);
+    if (get_config().enable_wake) {
+        memcpy(ms_os_20_buf + len, ms_os_20_audio, MS_OS_20_LEN_AUDIO);
+        len = (uint16_t) (len + MS_OS_20_LEN_AUDIO);
+    }
+    if (get_config().ps_shortcut_enabled) {
+        memcpy(ms_os_20_buf + len, ms_os_20_xinput, MS_OS_20_LEN_XINPUT);
+        len = (uint16_t) (len + MS_OS_20_LEN_XINPUT);
+    }
+
+    ms_os_20_buf[8] = (uint8_t) (len & 0xFF); // Set Header wTotalLength
+    ms_os_20_buf[9] = (uint8_t) (len >> 8);
+    const uint16_t sub = (uint16_t) (len - 0x0A);
+    ms_os_20_buf[16] = (uint8_t) (sub & 0xFF); // Configuration Subset wTotalLength
+    ms_os_20_buf[17] = (uint8_t) (sub >> 8);
+
+    desc_bos[BOS_MS_OS_20_LEN_OFFSET]     = (uint8_t) (len & 0xFF);
+    desc_bos[BOS_MS_OS_20_LEN_OFFSET + 1] = (uint8_t) (len >> 8);
+    return len;
+}
+
+// True when anything in the MS OS 2.0 set is worth advertising: the audio
+// selective-suspend opt-in (wake) or the XInput compatible ID (Game Bar).
+static bool ms_os_20_needed() {
+    return get_config().enable_wake || get_config().ps_shortcut_enabled;
+}
+
+uint8_t const *tud_descriptor_bos_cb(void) {
+    if (!ms_os_20_needed()) return nullptr;
+    ms_os_20_build();
+    return desc_bos;
+}
 
 // Vendor-class control transfer hook. Windows reads BOS, sees the MS OS 2.0
 // platform capability, then issues this vendor request to fetch the
 // descriptor set itself.
 bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t const *request) {
-    if (!get_config().enable_wake) return false;
+    if (!ms_os_20_needed()) return false;
     if (stage != CONTROL_STAGE_SETUP) return true;
     if (request->bmRequestType_bit.type != TUSB_REQ_TYPE_VENDOR) return false;
     if (request->bRequest == MS_OS_20_VENDOR_CODE && request->wIndex == 7) {
         // wIndex == 7 -> MS_OS_20_DESCRIPTOR_INDEX
-        return tud_control_xfer(rhport, request, (void *)(uintptr_t)desc_ms_os_20, sizeof(desc_ms_os_20));
+        const uint16_t len = ms_os_20_build();
+        return tud_control_xfer(rhport, request, ms_os_20_buf, len);
     }
     return false;
 }

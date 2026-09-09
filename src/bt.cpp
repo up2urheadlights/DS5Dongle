@@ -744,6 +744,7 @@ static void __not_in_flash_func(l2cap_packet_handler)(uint8_t packet_type, uint1
                         .AllowAudioControl = 1,
                         .AllowLedColor = 1,
                         .MicSelect = get_config().mic_select,
+                        .NoiseCancelEnable = 1,
                         .AllowLightBrightnessChange = 1,
                         .AllowColorLightFadeAnimation = 1,
                         .LightFadeAnimation = LightFadeAnimation::FadeOut,

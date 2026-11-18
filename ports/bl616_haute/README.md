@@ -15,11 +15,12 @@ Stage 1 of the port:
 | Bluetooth host | BTstack over the BL616 on-chip controller (`src/port/bl616/bt_transport_bl616.cpp`) |
 | Bond store | BTstack two-bank TLV in its own flash region (`board_haute.h`) |
 | USB to the PC | **Not yet.** TinyUSB is built with its no-op template driver; a BL616 device-controller driver is the next stage |
-| Debug log | USB serial port (CherryUSB CDC-ACM, VID `FFFF` PID `D012`) mirroring the console |
+| Debug log | Debug build only (`-DebugLog`): USB serial port (CherryUSB CDC-ACM, VID `FFFF` PID `D012`) mirroring the console |
 | Audio | Built and running (Opus, resampler); untestable until USB exists |
 
-So the only image today is the debug one: it pairs the DualSense and streams its
-input, which the log shows, but the PC sees a serial port, not a DualSense.
+CI builds the production image (no log port). Until the USB driver exists the
+PC sees nothing from it; the debug build pairs the DualSense and shows its
+input in the log.
 
 ## How it differs from the other targets
 
@@ -54,13 +55,14 @@ git submodule update --init lib/btstack lib/opus lib/WDL
 powershell -ExecutionPolicy Bypass -File ports\bl616_haute\build.ps1 `
     -SdkPath <bl_mcu_sdk @ BL_SDK_REF> `
     -ToolchainBin <toolchain_gcc_t-head_windows @ BL_TOOLCHAIN_REF>\bin `
-    -TinyUsbPath <tinyusb @ TINYUSB_REF> -DebugLog
+    -TinyUsbPath <tinyusb @ TINYUSB_REF> [-DebugLog]
 ```
 
 Use a short path (for example `subst W: <repo>`): the SDK builds with
 `-save-temps`, and deep object paths can pass Windows' 260-character limit.
 
-The result is one image, `build\ds5-bridge-haute-debug-merged.bin`: boot2 at
+The result is one image, `build\ds5-bridge-haute-merged.bin`
+(`ds5-bridge-haute-debug-merged.bin` with `-DebugLog`): boot2 at
 `0x0`, the partition table at `0xE000` and `0xF000`, the firmware at `0x10000`,
 gaps `0xFF`. Write it at `0x0` in one session.
 
@@ -72,7 +74,7 @@ Bouffalo's `BLFlashCommand` (in the SDK, `tools/bflb_tools/bouffalo_flash_cube`)
 
 ```powershell
 BLFlashCommand.exe --interface=uart --chipname=bl616 --port=COMx --baudrate=2000000 `
-    --flash --write --start=0x0 --file=ds5-bridge-haute-debug-merged.bin
+    --flash --write --start=0x0 --file=ds5-bridge-haute-merged.bin
 ```
 
 Do not pass any eFuse option. Back the flash up first (`--read --start=0x0

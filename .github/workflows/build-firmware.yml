@@ -467,23 +467,22 @@ jobs:
           # -save-temps) well under Windows' 260-character limit.
           subst W: "$env:GITHUB_WORKSPACE"
           $version = if ($env:FW_VER) { $env:FW_VER } else { 'dev' }
-          # The debug image (USB serial log port) is the only one until the
-          # BL616 USB device driver lands; see ports/bl616_haute/README.md.
+          # The production image: no debug log port.
           ./ports/bl616_haute/build.ps1 `
             -SdkPath W:\deps\bl_mcu_sdk `
             -ToolchainBin W:\deps\toolchain\bin `
             -TinyUsbPath W:\deps\tinyusb `
-            -DebugLog -Version $version
+            -Version $version
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           New-Item -ItemType Directory -Force artifacts | Out-Null
-          Copy-Item ports/bl616_haute/build/ds5-bridge-haute-debug-merged.bin `
-            "artifacts/ds5-bridge-haute-debug-merged$env:ASSET_SUFFIX.bin"
+          Copy-Item ports/bl616_haute/build/ds5-bridge-haute-merged.bin `
+            "artifacts/ds5-bridge-haute-merged$env:ASSET_SUFFIX.bin"
 
       - name: Upload BL616 Haute artifact
         uses: actions/upload-artifact@v7
         with:
-          name: ds5-bridge-haute-debug-merged${{ steps.firmware-meta.outputs.asset_suffix }}
-          path: artifacts/ds5-bridge-haute-debug-merged${{ steps.firmware-meta.outputs.asset_suffix }}.bin
+          name: ds5-bridge-haute-merged${{ steps.firmware-meta.outputs.asset_suffix }}
+          path: artifacts/ds5-bridge-haute-merged${{ steps.firmware-meta.outputs.asset_suffix }}.bin
           archive: false
           if-no-files-found: error
 

@@ -8,20 +8,19 @@ share.
 
 ## Status
 
-Stage 1 of the port:
+Stage 2 of the port:
 
 | Part | State |
 | --- | --- |
 | Bluetooth host | BTstack over the BL616 on-chip controller (`src/port/bl616/bt_transport_bl616.cpp`) |
 | Bond store | BTstack two-bank TLV in its own flash region (`board_haute.h`) |
-| USB to the PC | **Not yet.** TinyUSB is built with its no-op template driver; a BL616 device-controller driver is the next stage |
-| Debug log | Debug build only (`-DebugLog`): USB serial port (CherryUSB CDC-ACM, VID `FFFF` PID `D012`) mirroring the console |
-| Audio | Built and running (Opus, resampler); untestable until USB exists |
+| USB to the PC | TinyUSB with this port's controller driver (`src/port/bl616/dcd_bl616.c`, adapted from the Bouffalo SDK's Apache-2.0 driver) |
+| Wake keyboard | Collections inside the DualSense HID interface (`src/port/bl616/usb_hid_bl616.cpp`), see below |
+| Debug log | Debug build only (`-DebugLog`): the console, read over USB as HID feature report `0x4F` |
+| Audio | Speaker and microphone, as on the other targets |
 
-CI builds the production image (no log port). Until the USB driver exists the
-PC sees nothing from it; the debug build pairs the DualSense and shows its
-input in the log.
-
+CI builds the production image. The debug build presents the same device plus
+the log report.
 ## How it differs from the other targets
 
 - **One core.** The BL616 has a single E907. The audio worker that runs on a
@@ -45,6 +44,16 @@ input in the log.
 - **USB after Bluetooth.** USB starts only once Bluetooth is up, with the USB
   clock recovered first; starting it earlier lost the port mid-init on this
   board.
+- **Four endpoints.** The controller has EP1-4 besides EP0, one direction per
+  number, and the DualSense uses all four (`0x01` speaker, `0x82` mic,
+  `0x03`/`0x84` HID). So the wake keyboard and the consumer/system control
+  become extra top-level collections in the DualSense HID interface (report IDs
+  `0x40`-`0x42`, which no DualSense report uses) instead of interfaces of their
+  own, and in keyboard-only mode the keyboard moves to EP `0x81`. The adapter's
+  original firmware does the same in its DualSense mode. The shared sources are
+  unchanged: the layout is applied by link-time wrappers around the TinyUSB
+  descriptor and report calls. There is no endpoint for a CDC port, so the debug
+  log is a HID feature report instead.
 
 ## Build
 

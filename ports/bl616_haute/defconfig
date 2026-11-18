@@ -19,12 +19,8 @@ CONFIG_BLE_USE_MAC2 =n
 CONFIG_MULTIMEDIA =n
 CONFIG_OPUS =n
 
-# CherryUSB is the debug build's log port only (diag_cdc.c); the DualSense USB
-# device is TinyUSB.
-CONFIG_CHERRYUSB =y
-CONFIG_CHERRYUSB_OSAL =freertos
-CONFIG_CHERRYUSB_DEVICE =y
-CONFIG_CHERRYUSB_DEVICE_CDC_ACM =y
-CONFIG_USB_EHCI_HCOR_RESERVED_DISABLE =y
+# USB is TinyUSB with this port's own controller driver
+# (src/port/bl616/dcd_bl616.c), so the SDK's CherryUSB is not built.
+CONFIG_CHERRYUSB =n
 
 CONFIG_BACKTRACE =n

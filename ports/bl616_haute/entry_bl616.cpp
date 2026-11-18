@@ -17,11 +17,12 @@ extern "C" {
 #include "rfparam_adapter.h"
 }
 
-#if DS5_BL616_DIAG_CDC
-#include "diag_cdc.h"
+#if DS5_BL616_DIAG_LOG
+#include "diag_log.h"
 #endif
 
 extern int ds5_shared_main();
+extern "C" void bl616_dcd_start(void); // src/port/bl616/dcd_bl616.c
 
 // The SDK links with -nostartfiles, so crtbegin's __dso_handle (the key
 // __cxa_atexit files static destructors under) is absent. Destructors never
@@ -33,7 +34,7 @@ void *__dso_handle = &__dso_handle;
 // Main loop and audio worker share this priority so FreeRTOS time-slices the
 // two busy loops (port_bl616.cpp launch_worker). Everything that blocks -- the
 // Bluetooth controller (configMAX_PRIORITIES - 1), the timer service and the
-// debug log task -- runs above it and preempts.
+// debug heartbeat task -- runs above it and preempts.
 extern "C" const UBaseType_t g_ds5_main_task_priority = 4;
 
 namespace {
@@ -64,10 +65,11 @@ void run_constructors() {
 }
 } // namespace
 
+// Called from the Bluetooth transport, on the main task, once BTstack is up:
+// the point at which this board's USB controller can be started (it lost the
+// port when started before Bluetooth init).
 extern "C" void ds5_bl616_bt_ready(void) {
-#if DS5_BL616_DIAG_CDC
-    diag_cdc_request_usb();
-#endif
+    bl616_dcd_start();
 }
 
 extern "C" void vApplicationMallocFailedHook(void) {
@@ -85,8 +87,8 @@ extern "C" int ds5_bl616_entry(void) {
     printf("\r\n[BL616] DS5Dongle for Haute Adapter 4DS, build " DS5_FIRMWARE_VERSION "\r\n");
     run_constructors();
 
-#if DS5_BL616_DIAG_CDC
-    diag_cdc_start_task(configMAX_PRIORITIES - 2);
+#if DS5_BL616_DIAG_LOG
+    diag_log_start_heartbeat(configMAX_PRIORITIES - 2);
 #endif
 
     // RF calibration, before the scheduler and before the controller starts,

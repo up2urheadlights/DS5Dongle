@@ -8,7 +8,8 @@
 #   BL_SDK_BASE   Bouffalo bl_mcu_sdk checkout (pinned in build-firmware.yml)
 #   TINYUSB_PATH  TinyUSB checkout (the same ref the Pico build pins)
 #   DS5_VERSION   firmware version string (optional, "dev" otherwise)
-#   DS5_BL616_DIAG_CDC  1 = debug build with the USB serial log port
+#   DS5_BL616_DIAG_LOG  1 = debug build: the console log, readable over USB as a
+#                       HID feature report (diag_log.c)
 
 cmake_minimum_required(VERSION 3.15)
 
@@ -35,9 +36,9 @@ if(DEFINED ENV{DS5_VERSION} AND NOT "$ENV{DS5_VERSION}" STREQUAL "")
 else()
     set(DS5_VERSION "dev")
 endif()
-set(DS5_BL616_DIAG_CDC 0)
-if(DEFINED ENV{DS5_BL616_DIAG_CDC} AND "$ENV{DS5_BL616_DIAG_CDC}" STREQUAL "1")
-    set(DS5_BL616_DIAG_CDC 1)
+set(DS5_BL616_DIAG_LOG 0)
+if(DEFINED ENV{DS5_BL616_DIAG_LOG} AND "$ENV{DS5_BL616_DIAG_LOG}" STREQUAL "1")
+    set(DS5_BL616_DIAG_LOG 1)
 endif()
 
 # ------------------------------------------------------------------ firmware
@@ -62,6 +63,8 @@ set(FW_SOURCES
     "${SRC_DIR}/wdl_resample.cpp"
     "${SRC_DIR}/port/bl616/port_bl616.cpp"
     "${SRC_DIR}/port/bl616/bt_transport_bl616.cpp"
+    "${SRC_DIR}/port/bl616/usb_hid_bl616.cpp"
+    "${SRC_DIR}/port/bl616/dcd_bl616.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/entry_bl616.cpp"
 )
 # ram_mem.c is not built: it moves the Pico's newlib mem ops out of flash; on
@@ -110,9 +113,8 @@ set(BTSTACK_INCLUDES
 
 # ------------------------------------------------------------------- TinyUSB
 
-# Stage 1: the TinyUSB device stack with its no-op template controller
-# driver, so the shared USB code compiles and runs with USB inert. The BL616
-# device-controller driver replaces dcd_template.c in a later stage.
+# The TinyUSB device stack. Its controller driver for the BL616 is
+# src/port/bl616/dcd_bl616.c (in FW_SOURCES); TinyUSB has none of its own.
 set(TINYUSB_SOURCES
     "${TINYUSB_DIR}/src/tusb.c"
     "${TINYUSB_DIR}/src/common/tusb_fifo.c"
@@ -121,7 +123,6 @@ set(TINYUSB_SOURCES
     "${TINYUSB_DIR}/src/class/audio/audio_device.c"
     "${TINYUSB_DIR}/src/class/vendor/vendor_device.c"
     "${TINYUSB_DIR}/src/class/cdc/cdc_device.c"
-    "${TINYUSB_DIR}/src/portable/template/dcd_template.c"
 )
 
 # ---------------------------------------------------------------------- Opus
@@ -191,14 +192,33 @@ target_compile_definitions(app PRIVATE
     TUP_DCD_ENDPOINT_MAX=5
     BOARD_TUD_MAX_SPEED=OPT_MODE_HIGH_SPEED
     ENABLE_BATT_LED=1
+    # Always 0 here: there is no endpoint left for a CDC port (the debug log
+    # rides a HID feature report instead, DS5_BL616_DIAG_LOG).
     ENABLE_SERIAL=0
     ENABLE_DEBUG=0
     ENABLE_VERBOSE=0
+    # The wake keyboard and consumer control, as on the other targets; here
+    # they are collections inside the DualSense HID interface
+    # (src/port/bl616/usb_hid_bl616.cpp).
+    ENABLE_WAKE_HID
     DISABLE_SPEAKER_PROC=0
     WDL_RESAMPLE_TYPE=float
     DS5_FIRMWARE_VERSION="${DS5_VERSION}"
-    DS5_BL616_DIAG_CDC=${DS5_BL616_DIAG_CDC}
+    DS5_BL616_DIAG_LOG=${DS5_BL616_DIAG_LOG}
 )
+# TinyUSB's endpoint buffers in non-cacheable RAM (the controller's DMA reads
+# and writes them); force-included so every TinyUSB unit agrees.
+# SHELL: keeps the pair together -- CMake de-duplicates a bare "-include" against
+# the SDK's own "-include autoconf.h" and drops one.
+target_compile_options(app PRIVATE "SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/bl616_tusb_mem.h")
+# The four-endpoint layout (usb_hid_bl616.cpp): these TinyUSB calls are
+# wrapped where the shared code and TinyUSB call each other.
+sdk_add_link_options(-Wl,--wrap=tud_descriptor_configuration_cb
+                     -Wl,--wrap=tud_hid_descriptor_report_cb
+                     -Wl,--wrap=tud_hid_n_ready
+                     -Wl,--wrap=tud_hid_n_report
+                     -Wl,--wrap=tud_hid_n_keyboard_report
+                     -Wl,--wrap=tud_hid_get_report_cb)
 
 target_compile_options(app PRIVATE
     -Wno-undef
@@ -210,10 +230,10 @@ target_compile_options(app PRIVATE
 set_source_files_properties(${BTSTACK_SOURCES} ${TINYUSB_SOURCES} PROPERTIES
     COMPILE_OPTIONS "-Wno-maybe-uninitialized;-Wno-unused-variable;-Wno-unused-function")
 
-if(DS5_BL616_DIAG_CDC)
-    target_sources(app PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/diag_cdc.c")
+if(DS5_BL616_DIAG_LOG)
+    target_sources(app PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/diag_log.c")
     # Every console byte is copied into the log ring by wrapping the SDK's
-    # UART output calls (diag_cdc.c), so nothing else needs to change.
+    # UART output calls (diag_log.c), so nothing else needs to change.
     sdk_add_link_options(-Wl,--wrap=bflb_uart_putchar
                          -Wl,--wrap=bflb_uart_put
                          -Wl,--wrap=bflb_uart_put_block)

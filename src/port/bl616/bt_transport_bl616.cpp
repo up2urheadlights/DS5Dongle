@@ -54,9 +54,11 @@ extern "C" {
 #include "task.h"
 }
 
-// Hook from main_bl616.c: start the debug CDC log once Bluetooth is up (USB is
-// started only after Bluetooth init on this chip). A no-op in non-debug builds.
+// Hook from entry_bl616.cpp: start the USB controller once Bluetooth is up (USB
+// is started only after Bluetooth init on this chip).
 extern "C" void ds5_bl616_bt_ready(void);
+// dcd_bl616.c: starts USB anyway if Bluetooth has not come up within 20 s.
+extern "C" void bl616_dcd_poll(void);
 
 namespace {
 
@@ -380,9 +382,11 @@ void bt_transport_poll() {
         }
     }
 
-#if DS5_BL616_DIAG_CDC
+    bl616_dcd_poll();
+
+#if DS5_BL616_DIAG_LOG
     // Debug build: the incoming ACL rate, so the log shows the pad's input
-    // reports arriving even while there is no USB device to forward them to.
+    // reports arriving whatever the USB side is doing.
     // A DualSense streaming input over Bluetooth sends several hundred a second.
     {
         static uint32_t last_ms = 0, last_count = 0;

@@ -75,6 +75,7 @@ uint8_t g_rx_scratch[1 + 4 + 2048];
 volatile uint32_t g_rx_dropped = 0;
 volatile uint32_t g_rx_dropped_events = 0;
 volatile uint32_t g_rx_acl_bad_len = 0;
+uint32_t g_rx_acl_count = 0; // main task only
 constexpr uint32_t kDroppedEventCodes = 8;
 volatile uint8_t g_rx_dropped_event_code[kDroppedEventCodes] = {};
 
@@ -374,9 +375,29 @@ void bt_transport_poll() {
         bflb_irq_restore(flags);
 
         if (g_packet_handler != nullptr && len >= 1) {
+            if (g_rx[0] == HCI_ACL_DATA_PACKET) ++g_rx_acl_count;
             g_packet_handler(g_rx[0], &g_rx[1], static_cast<uint16_t>(len - 1));
         }
     }
+
+#if DS5_BL616_DIAG_CDC
+    // Debug build: the incoming ACL rate, so the log shows the pad's input
+    // reports arriving even while there is no USB device to forward them to.
+    // A DualSense streaming input over Bluetooth sends several hundred a second.
+    {
+        static uint32_t last_ms = 0, last_count = 0;
+        const uint32_t now = port::now_ms();
+        if (now - last_ms >= 5000) {
+            const uint32_t count = g_rx_acl_count;
+            if (count != last_count) {
+                printf("[BT] incoming ACL: %lu packets in the last %lu ms\n",
+                       (unsigned long) (count - last_count), (unsigned long) (now - last_ms));
+            }
+            last_ms = now;
+            last_count = count;
+        }
+    }
+#endif
 
     {
         static uint32_t reported_drops = 0, reported_events = 0, reported_bad = 0;

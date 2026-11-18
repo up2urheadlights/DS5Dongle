@@ -54,6 +54,11 @@ on:
         required: false
         type: boolean
         default: false
+      bl616_haute:
+        description: Also build the BL616 (Haute Adapter 4DS) merged flash image
+        required: false
+        type: boolean
+        default: false
 
 env:
   PICO_SDK_REF: 2.3.1
@@ -63,6 +68,11 @@ env:
   # reason PICO_SDK_REF and TINYUSB_REF are -- floating on espressif/idf:latest
   # broke this job when master changed under it.
   IDF_REF: 08e0d30a74ad0bfd5a34933142b80f45619ee410
+  # BL616: Bouffalo's SDK (2.3.24) and its Windows T-Head toolchain
+  # (Xuantie-900 GCC 10.2.0, V2.6.1 B-20220906), pinned by commit like the refs
+  # above. TinyUSB is TINYUSB_REF, the same tree the Pico build uses.
+  BL_SDK_REF: d9306a4a221db414131337ec95113e3adaf7072b
+  BL_TOOLCHAIN_REF: 072fc29d765774d66366c57a4d962e90c366ef1b
   PICO_SDK_PATH: ${{ github.workspace }}/pico-sdk
   ARM_TOOLCHAIN_VERSION: 15.2.rel1
   ARM_TOOLCHAIN_URL: https://gitlab.arm.com/api/v4/projects/tooling%2Fgnu-toolchains-for-arm/packages/generic/gnu-toolchain/15.2.rel1/arm-gnu-toolchain-15.2.rel1-x86_64-arm-none-eabi.tar.xz
@@ -389,6 +399,91 @@ jobs:
         with:
           name: ds5-bridge-esp32s31-alef-merged${{ steps.firmware-meta.outputs.asset_suffix }}
           path: artifacts/ds5-bridge-esp32s31-alef-merged${{ steps.firmware-meta.outputs.asset_suffix }}.bin
+          archive: false
+          if-no-files-found: error
+
+  bl616_haute:
+    name: Build BL616 Haute Adapter 4DS firmware
+    if: inputs.bl616_haute
+    # The Bouffalo SDK ships Windows builds of make, CMake and its image tools,
+    # and the pinned T-Head toolchain is the Windows one, so this job runs on
+    # Windows like the SDK's own reproducible builds.
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ inputs.repo == '' && github.repository || inputs.repo }}
+          ref: ${{ inputs.ref }}
+          submodules: recursive
+
+      - name: Check out the Bouffalo SDK
+        uses: actions/checkout@v5
+        with:
+          repository: bouffalolab/bl_mcu_sdk
+          ref: ${{ env.BL_SDK_REF }}
+          path: deps/bl_mcu_sdk
+
+      - name: Check out the T-Head toolchain
+        uses: actions/checkout@v5
+        with:
+          repository: bouffalolab/toolchain_gcc_t-head_windows
+          ref: ${{ env.BL_TOOLCHAIN_REF }}
+          path: deps/toolchain
+
+      - name: Check out TinyUSB
+        uses: actions/checkout@v5
+        with:
+          repository: hathach/tinyusb
+          ref: ${{ env.TINYUSB_REF }}
+          path: deps/tinyusb
+
+      - name: Resolve firmware metadata
+        id: firmware-meta
+        shell: bash
+        env:
+          IN_VER: ${{ inputs.version }}
+          IN_ASSET_SUFFIX: ${{ inputs.asset_suffix }}
+          IN_UPLOAD_TAG: ${{ inputs.upload_tag }}
+        run: |
+          v="$IN_VER"
+          if printf '%s' "$v" | grep -qE '^[0-9a-f]{40}$'; then
+            v="${v:0:7}"
+          fi
+          echo "FW_VER=$v" >> "$GITHUB_ENV"
+
+          asset_suffix="$IN_ASSET_SUFFIX"
+          if [ -z "$asset_suffix" ] && [ -z "$IN_UPLOAD_TAG" ]; then
+            asset_suffix="-$(git rev-parse --short=7 HEAD)"
+          fi
+          echo "asset_suffix=$asset_suffix" >> "$GITHUB_OUTPUT"
+
+      - name: Build BL616 Haute firmware
+        shell: pwsh
+        env:
+          ASSET_SUFFIX: ${{ steps.firmware-meta.outputs.asset_suffix }}
+        run: |
+          # A short drive letter keeps the SDK's object paths (it builds with
+          # -save-temps) well under Windows' 260-character limit.
+          subst W: "$env:GITHUB_WORKSPACE"
+          $version = if ($env:FW_VER) { $env:FW_VER } else { 'dev' }
+          # The debug image (USB serial log port) is the only one until the
+          # BL616 USB device driver lands; see ports/bl616_haute/README.md.
+          ./ports/bl616_haute/build.ps1 `
+            -SdkPath W:\deps\bl_mcu_sdk `
+            -ToolchainBin W:\deps\toolchain\bin `
+            -TinyUsbPath W:\deps\tinyusb `
+            -DebugLog -Version $version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory -Force artifacts | Out-Null
+          Copy-Item ports/bl616_haute/build/ds5-bridge-haute-debug-merged.bin `
+            "artifacts/ds5-bridge-haute-debug-merged$env:ASSET_SUFFIX.bin"
+
+      - name: Upload BL616 Haute artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ds5-bridge-haute-debug-merged${{ steps.firmware-meta.outputs.asset_suffix }}
+          path: artifacts/ds5-bridge-haute-debug-merged${{ steps.firmware-meta.outputs.asset_suffix }}.bin
           archive: false
           if-no-files-found: error
 

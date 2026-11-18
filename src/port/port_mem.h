@@ -22,4 +22,13 @@
 #define PORT_FAST_FUNC(fn) IRAM_ATTR fn
 #define PORT_FAST_DATA DRAM_ATTR
 
+#elif defined(PORT_PLATFORM_BL616)
+
+// The SDK linker script copies .tcm_code.* into RAM at boot (ATTR_TCM_SECTION
+// in compiler_ld.h). Data is already in RAM on this part -- there is no PSRAM
+// on the Haute's BL616 and .data/.bss never live in flash -- so the data macro
+// needs no section.
+#define PORT_FAST_FUNC(fn) __attribute__((section(".tcm_code.port_fast"))) fn
+#define PORT_FAST_DATA
+
 #endif

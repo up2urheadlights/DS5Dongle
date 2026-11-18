@@ -15,6 +15,8 @@
 #include "pico/port_flash_impl.h"
 #elif defined(PORT_PLATFORM_ESP32S31)
 #include "esp32s31/port_flash_impl.h"
+#elif defined(PORT_PLATFORM_BL616)
+#include "bl616/port_flash_impl.h"
 #endif
 
 namespace port {

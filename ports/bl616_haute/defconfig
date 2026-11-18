@@ -1,0 +1,30 @@
+# Bouffalo SDK configuration for the BL616 Haute target.
+
+CONFIG_FREERTOS =y
+CONFIG_BFLB_LOG =n
+CONFIG_SHELL =n
+CONFIG_CONSOLE_UART_BAUDRATE =115200
+
+# Bluetooth: Bouffalo's controller library only. The host is BTstack (built by
+# CMakeLists.txt from lib/btstack), reached through src/port/bl616/
+# bt_transport_bl616.cpp, so Bouffalo's own host stack is not built.
+CONFIG_BLUETOOTH =y
+CONFIG_RF =y
+CONFIG_BTBLECONTROLLER_LIB =ble1m2s1bredr1
+CONFIG_BLE_HOST_DISABLE =y
+CONFIG_BLE_USE_MAC2 =n
+
+# Opus comes from lib/opus (CMakeLists.txt), as on the other targets, not the
+# SDK's prebuilt archive: the two would collide.
+CONFIG_MULTIMEDIA =n
+CONFIG_OPUS =n
+
+# CherryUSB is the debug build's log port only (diag_cdc.c); the DualSense USB
+# device is TinyUSB.
+CONFIG_CHERRYUSB =y
+CONFIG_CHERRYUSB_OSAL =freertos
+CONFIG_CHERRYUSB_DEVICE =y
+CONFIG_CHERRYUSB_DEVICE_CDC_ACM =y
+CONFIG_USB_EHCI_HCOR_RESERVED_DISABLE =y
+
+CONFIG_BACKTRACE =n

@@ -12,7 +12,7 @@ extern bool usb_keyboard_only;
 extern bool usb_reconfiguring;
 uint8_t usb_keyboard_instance();
 void usb_reconnect(bool keyboard_only);
-#if defined(PORT_PLATFORM_ESP32S31)
+#if defined(PORT_ONDIE_BT_CONTROLLER)
 void usb_reconnect_task(); // main loop: completes a usb_reconnect() once its 150 ms gap has passed
 #endif
 

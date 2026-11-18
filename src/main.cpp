@@ -456,7 +456,7 @@ int main() {
 #endif
         port::bt_transport_poll();
         bt_task();
-#if defined(PORT_PLATFORM_ESP32S31)
+#if defined(PORT_ONDIE_BT_CONTROLLER)
         usb_reconnect_task();
 #endif
         tud_task();

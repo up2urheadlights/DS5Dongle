@@ -52,7 +52,7 @@ static void l2cap_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t 
 static btstack_packet_callback_registration_t hci_event_callback_registration, l2cap_event_callback_registration;
 static bd_addr_t current_device_addr;
 
-#if defined(PORT_PLATFORM_ESP32S31)
+#if defined(PORT_ONDIE_BT_CONTROLLER)
 // Last colour the host asked for, so the pulse re-applies it instead of
 // overriding it. Defaults to the firmware colour for the case where the pulse
 // lands before the host has said anything.
@@ -72,7 +72,7 @@ bool bt_inquiring = false;
 // controller's reconnect needs. Espressif's blob lets inquiry dominate where
 // CYW43439 interleaves fairly, hence the single target. Explicit discovery
 // (BOOTSEL click) still runs one long inquiry.
-#if defined(PORT_PLATFORM_ESP32S31)
+#if defined(PORT_ONDIE_BT_CONTROLLER)
 #define BT_INQUIRY_BURSTS 1
 #else
 #define BT_INQUIRY_BURSTS 0
@@ -123,7 +123,7 @@ static bool bt_has_stored_link_key() {
 }
 #endif
 
-#if defined(PORT_PLATFORM_ESP32S31)
+#if defined(PORT_ONDIE_BT_CONTROLLER)
 // Lightbar handover, sent on every link. A DualSense that reconnects WITHOUT
 // having rebooted (PS-hold after a fresh pairing, or the dongle resetting under a
 // running pad) keeps its blue connect pulse and ignores every colour, including
@@ -462,7 +462,7 @@ void bt_bootsel_hold_action() {
 }
 
 void bt_note_host_led(uint8_t r, uint8_t g, uint8_t b) {
-#if defined(PORT_PLATFORM_ESP32S31)
+#if defined(PORT_ONDIE_BT_CONTROLLER)
     host_led_r = r;
     host_led_g = g;
     host_led_b = b;
@@ -475,7 +475,7 @@ void bt_note_host_led(uint8_t r, uint8_t g, uint8_t b) {
 }
 
 void bt_note_host_player(uint8_t bits) {
-#if defined(PORT_PLATFORM_ESP32S31)
+#if defined(PORT_ONDIE_BT_CONTROLLER)
     host_player_bits = bits & 0x3F;
     host_player_set = true;
 #else
@@ -537,7 +537,7 @@ static bool bt_try_create_connection() {
     return rc == ERROR_CODE_SUCCESS;
 }
 
-#if defined(PORT_PLATFORM_ESP32S31)
+#if defined(PORT_ONDIE_BT_CONTROLLER)
 // The handover reports go out as 0x31, the DualSense's plain Bluetooth output
 // report -- the one forward_output_report() uses for the host's own reports.
 static void send_state_0x31(const SetStateData &state) {
@@ -577,7 +577,7 @@ static void paint_host_lights() {
 // CommandComplete handler is too early, as the credit is restored after app
 // callbacks have run.
 void bt_task() {
-#if defined(PORT_PLATFORM_ESP32S31)
+#if defined(PORT_ONDIE_BT_CONTROLLER)
     if (release_lights_at_ms != 0 && port::now_ms() >= release_lights_at_ms) {
         release_lights_at_ms = 0;
         if (hid_interrupt_cid == 0) {
@@ -673,7 +673,7 @@ static void PORT_FAST_FUNC(hci_packet_handler)(uint8_t packet_type, uint16_t cha
             const uint8_t state = btstack_event_state_get_state(packet);
             printf("[BT] State: %u\n", state);
             if (state == HCI_STATE_WORKING) {
-#if defined(PORT_PLATFORM_ESP32S31)
+#if defined(PORT_ONDIE_BT_CONTROLLER)
                 // interval 50ms, window 11.25ms. Core Spec 5.4 Vol 2 Part B
                 // 8.3.1 requires interval >= 2x window for interlaced scan.
                 // Neither HCI command validates the pair, so equal values
@@ -915,7 +915,7 @@ static void PORT_FAST_FUNC(hci_packet_handler)(uint8_t packet_type, uint16_t cha
             if (link) {
                 printf("[HCI] Link key request from %s, reply stored key type=%u\n", bd_addr_to_str(addr),
                        (unsigned int) link_key_type);
-#if defined(PORT_PLATFORM_ESP32S31)
+#if defined(PORT_ONDIE_BT_CONTROLLER)
                 // As in the no-key branch below: BTstack answers link key
                 // requests itself (hci.c, AUTH_FLAG_HANDLE_LINK_KEY_REQUEST),
                 // reading the same TLV database this printf just read, so the
@@ -926,7 +926,7 @@ static void PORT_FAST_FUNC(hci_packet_handler)(uint8_t packet_type, uint16_t cha
                 hci_send_cmd(&hci_link_key_request_reply, addr, link_key);
             } else {
                 printf("[HCI] Link key request from %s, no key, force re-pair\n", bd_addr_to_str(addr));
-#if defined(PORT_PLATFORM_ESP32S31)
+#if defined(PORT_ONDIE_BT_CONTROLLER)
                 // Deliberately do NOT reply: BTstack already sends the negative
                 // reply (hci.c, hci_link_key_request_negative_reply). Replying
                 // again puts two responses on the wire for one request, the
@@ -943,7 +943,7 @@ static void PORT_FAST_FUNC(hci_packet_handler)(uint8_t packet_type, uint16_t cha
             hci_event_user_confirmation_request_get_bd_addr(packet, addr);
             printf("[%lu] [HCI] User confirmation request from %s, accept\n",
                    (unsigned long) port::now_ms(), bd_addr_to_str(addr));
-#if defined(PORT_PLATFORM_ESP32S31)
+#if defined(PORT_ONDIE_BT_CONTROLLER)
             // Same duplicate-response hazard as the link key request above, and
             // the one that crashed the controller (assert in olm_lmp_ssp.c:1820).
             // BTstack auto-accepts user confirmation (hci_stack->ssp_auto_accept)
@@ -980,7 +980,7 @@ static void PORT_FAST_FUNC(hci_packet_handler)(uint8_t packet_type, uint16_t cha
                 bt_disconnect();
                 gap_inquiry_start(30);
             } else {
-#if defined(PORT_PLATFORM_ESP32S31)
+#if defined(PORT_ONDIE_BT_CONTROLLER)
                 // BTstack requests encryption itself from hci_run() once
                 // authentication completes (BONDING_SEND_ENCRYPTION_REQUEST), so
                 // ours is a duplicate -- observed on the wire 1ms later, answered
@@ -1038,7 +1038,7 @@ static void PORT_FAST_FUNC(hci_packet_handler)(uint8_t packet_type, uint16_t cha
                 connection_pending_incoming = true;
                 inquiry_next_at_ms = 0; // drop any burst already scheduled
 #endif
-#if defined(PORT_PLATFORM_ESP32S31)
+#if defined(PORT_ONDIE_BT_CONTROLLER)
                 // Left to BTstack, which accepts from hci_run() with the same
                 // "remain slave" policy. Accepting here put a second
                 // Accept_Connection_Request ahead of gap_inquiry_stop()'s
@@ -1070,7 +1070,7 @@ static void PORT_FAST_FUNC(hci_packet_handler)(uint8_t packet_type, uint16_t cha
             bt_rssi = 0;
             hid_control_cid = 0;
             hid_interrupt_cid = 0;
-#if defined(PORT_PLATFORM_ESP32S31)
+#if defined(PORT_ONDIE_BT_CONTROLLER)
             release_lights_at_ms = 0;
             release_wait_input = false;
             release_lights_stage = 0;
@@ -1115,7 +1115,7 @@ static void PORT_FAST_FUNC(l2cap_packet_handler)(uint8_t packet_type, uint16_t c
         if (channel == hid_interrupt_cid) {
             // printf("[L2CAP] HID Interrupt data len=%u\n", size);
             // printf_hexdump(packet, size);
-#if defined(PORT_PLATFORM_ESP32S31)
+#if defined(PORT_ONDIE_BT_CONTROLLER)
             if (release_wait_input && size >= 34 && packet[1] == 0x31) {
                 const uint32_t ts = packet[30] | packet[31] << 8 | packet[32] << 16 |
                                     static_cast<uint32_t>(packet[33]) << 24;
@@ -1236,12 +1236,12 @@ static void PORT_FAST_FUNC(l2cap_packet_handler)(uint8_t packet_type, uint16_t c
                     // began mid-sequence and the DualSense rejected it -- which is
                     // why replugging the dongle (a reboot) worked while a PS-hold
                     // power-cycle did not.
-#if defined(PORT_PLATFORM_ESP32S31)
+#if defined(PORT_ONDIE_BT_CONTROLLER)
                     reportSeqCounter = 0;
 #endif
 
                     init_feature();
-#if !defined(PORT_PLATFORM_ESP32S31)
+#if !defined(PORT_ONDIE_BT_CONTROLLER)
                     // ESP32-S31 sends its lightbar setup from the handover in
                     // bt_task() instead (see kHandoverFallbackMs).
                     SetStateData state = {
@@ -1264,7 +1264,7 @@ static void PORT_FAST_FUNC(l2cap_packet_handler)(uint8_t packet_type, uint16_t c
 #endif
 #endif
 
-#if defined(PORT_PLATFORM_ESP32S31)
+#if defined(PORT_ONDIE_BT_CONTROLLER)
                     // The audio section of the state the RP2350 sends above. The
                     // handover reports carry lights only, so without this nothing on
                     // this link sets NoiseCancelEnable, and the speaker is attenuated
@@ -1517,7 +1517,7 @@ void init_feature() {
 void update_state(const SetStateData &state) {
     uint8_t pkt[142]{};
     pkt[0] = 0x32;
-#if defined(PORT_PLATFORM_ESP32S31)
+#if defined(PORT_ONDIE_BT_CONTROLLER)
     // Byte 1 carries the report sequence number, shared with every other
     // output report on the link (audio_send_*, forward_output_report), so take
     // the next one rather than a constant.

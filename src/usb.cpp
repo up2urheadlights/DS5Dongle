@@ -16,7 +16,7 @@
 bool usb_keyboard_only = false;
 // True from deliberate USB disconnect until remount, preventing reports to stale HID interfaces.
 bool usb_reconfiguring = false;
-#if defined(PORT_PLATFORM_ESP32S31)
+#if defined(PORT_ONDIE_BT_CONTROLLER)
 static uint32_t usb_reconnect_at_ms = 0; // pending tud_connect(); 0 = none
 #endif
 
@@ -30,7 +30,7 @@ void usb_reconnect(bool keyboard_only) {
     extern bool spk_active;
     spk_active = false;
     set_mic_active(false);
-#if defined(PORT_PLATFORM_ESP32S31)
+#if defined(PORT_ONDIE_BT_CONTROLLER)
     // Reconnect from the main loop instead of sleeping here. This runs from the
     // Bluetooth event handler (the 0x20 feature reply), and 150 ms of blocking
     // there stalled the BT pump long enough to overflow the HCI receive ring --
@@ -43,7 +43,7 @@ void usb_reconnect(bool keyboard_only) {
 #endif
 }
 
-#if defined(PORT_PLATFORM_ESP32S31)
+#if defined(PORT_ONDIE_BT_CONTROLLER)
 void usb_reconnect_task() {
     if (usb_reconnect_at_ms == 0 || port::now_ms() < usb_reconnect_at_ms) return;
     usb_reconnect_at_ms = 0;

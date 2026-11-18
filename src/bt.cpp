@@ -749,6 +749,17 @@ static void PORT_FAST_FUNC(hci_packet_handler)(uint8_t packet_type, uint16_t cha
             if (device_found) {
                 printf("[HCI] Connecting to %s...\n", bd_addr_to_str(current_device_addr));
                 new_pair = true;
+                // A DualSense answers inquiry only in pairing mode (PS+Create),
+                // and a pad in pairing mode has already discarded its old key.
+                // Offering ours anyway gets AuthComplete 0x06 (PIN or Key
+                // Missing) on every attempt when the pad was last paired to
+                // another firmware on this same adapter. Drop the key for THIS
+                // address only -- other pads' keys, the blacklist and the
+                // config record are untouched -- so the connect goes straight
+                // to fresh pairing.
+                gap_drop_link_key_for_bd_addr(current_device_addr);
+                printf("[HCI] Pairing-mode pad: no stored key offered to %s\n",
+                       bd_addr_to_str(current_device_addr));
                 // gap_inquiry_stop() above sent HCI_INQUIRY_CANCEL, and BTstack
                 // raises GAP_EVENT_INQUIRY_COMPLETE while that command is still
                 // outstanding -- so there is often no command credit left here

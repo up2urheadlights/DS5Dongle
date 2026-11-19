@@ -118,6 +118,120 @@ static volatile uint32_t g_wait_timeouts;
 static volatile uint32_t g_cx_vdma_preempted;
 #if DS5_BL616_DIAG_LOG
 static volatile bool g_speed_after_reset_pending;
+
+/* Variant P: what the USB-silence check needs (bl616_dcd_diag_check_silence).
+ * "Configured" is the last SET_CONFIGURATION's value being non-zero, cleared by
+ * a bus reset; "suspended" is a suspend interrupt not yet followed by a resume,
+ * a reset or a SETUP. */
+static volatile bool g_diag_configured;
+static volatile bool g_diag_suspended;
+static volatile uint32_t g_diag_last_irq_ms;   /* last USB device interrupt of any kind */
+static volatile uint32_t g_diag_disc_ms;       /* dcd_disconnect() time, 0 while connected */
+static volatile bool g_diag_disc_while_configured;
+static uint32_t g_diag_sfn_last;
+static uint32_t g_diag_sfn_change_ms;
+static bool g_diag_sfn_sampled;
+static bool g_diag_sfn_moving;                 /* the SOF frame number has been seen to change */
+static bool g_diag_suspend_noted;
+/* The 200 ms after an audio alt-setting change: every EP1/EP2 transfer and
+ * completion is logged, up to DIAG_WIN_MAX_LINES lines, plus the first
+ * DIAG_WIN_FIRST completions per endpoint whenever they come. */
+#define DIAG_WIN_MS          200u
+#define DIAG_WIN_MAX_LINES   64u
+#define DIAG_WIN_FIRST       8u
+static volatile uint32_t g_diag_win_until_ms;
+static volatile uint32_t g_diag_win_lines;
+static volatile uint8_t g_diag_win_first[3];
+static volatile uint32_t g_diag_arm_us[3];
+
+/* The last USB events, in two rings: bus and control events, and EP1/EP2 data
+ * events (EP3/EP4 HID traffic is only counted). Dumped by bl616_dcd_diag_dump(). */
+enum {
+    EV_SETUP = 1, EV_BUS_RESET, EV_SUSPEND, EV_RESUME, EV_OPEN, EV_CLOSE_ALL, EV_CONNECT, EV_DISCONNECT,
+    EV_STALL, EV_SETUP_TIMEOUT, EV_ZLP_RX, EV_ARM, EV_DONE, EV_CLEAR_STALL,
+};
+struct diag_usb_evt {
+    uint32_t t_ms;
+    uint8_t kind;
+    uint8_t ep;
+    uint16_t a;
+    uint32_t b;
+};
+#define DIAG_EVT_N 24u
+static struct diag_usb_evt g_ev_ctl[DIAG_EVT_N];
+static struct diag_usb_evt g_ev_dat[DIAG_EVT_N];
+static volatile uint32_t g_ev_ctl_n, g_ev_dat_n;
+
+extern bool usb_keyboard_only; /* usb.cpp */
+
+static void ev_push(bool data, uint8_t kind, uint8_t ep, uint16_t a, uint32_t b)
+{
+    uintptr_t const flags = bflb_irq_save();
+    struct diag_usb_evt *ring = data ? g_ev_dat : g_ev_ctl;
+    volatile uint32_t *n = data ? &g_ev_dat_n : &g_ev_ctl_n;
+    struct diag_usb_evt *e = &ring[*n % DIAG_EVT_N];
+    e->t_ms = (uint32_t)bflb_mtimer_get_time_ms();
+    e->kind = kind;
+    e->ep = ep;
+    e->a = a;
+    e->b = b;
+    *n = *n + 1u;
+    bflb_irq_restore(flags);
+}
+
+static const char *ev_name(uint8_t k)
+{
+    switch (k) {
+        case EV_SETUP: return "SETUP";
+        case EV_BUS_RESET: return "BUSRESET";
+        case EV_SUSPEND: return "SUSPEND";
+        case EV_RESUME: return "RESUME";
+        case EV_OPEN: return "OPEN";
+        case EV_CLOSE_ALL: return "CLOSEALL";
+        case EV_CONNECT: return "CONNECT";
+        case EV_DISCONNECT: return "DISCONNECT";
+        case EV_STALL: return "STALL";
+        case EV_SETUP_TIMEOUT: return "SETUP_TIMEOUT";
+        case EV_ZLP_RX: return "ZLP_RX";
+        case EV_ARM: return "ARM";
+        case EV_DONE: return "DONE";
+        case EV_CLEAR_STALL: return "CLRSTALL";
+        default: return "?";
+    }
+}
+
+/* EP1/EP2 transfers and completions near a stream start, as log lines. */
+static void diag_iso_trace(bool done, uint8_t ep_addr, uint32_t len, uint32_t armed_len)
+{
+    uint8_t const num = (uint8_t)(ep_addr & 0x0F);
+    if (num != 1 && num != 2) {
+        return;
+    }
+    ev_push(true, done ? EV_DONE : EV_ARM, ep_addr, (uint16_t)len, armed_len);
+    uint32_t const now = (uint32_t)bflb_mtimer_get_time_ms();
+    uint32_t const us = (uint32_t)bflb_mtimer_get_time_us();
+    bool const in_window = (int32_t)(g_diag_win_until_ms - now) > 0;
+    if (!done) {
+        g_diag_arm_us[num] = us;
+    }
+    if ((!in_window && !(done && g_diag_win_first[num] != 0)) || g_diag_win_lines >= DIAG_WIN_MAX_LINES) {
+        return;
+    }
+    g_diag_win_lines++;
+    if (done) {
+        if (g_diag_win_first[num] != 0) {
+            g_diag_win_first[num]--;
+        }
+        diag_logf("[usb] t=%lu.%03lu ep 0x%02x DONE len=%lu of %lu armed, %lu us after it was armed%s\r\n",
+                  (unsigned long)(us / 1000u), (unsigned long)(us % 1000u), ep_addr, (unsigned long)len,
+                  (unsigned long)armed_len, (unsigned long)(us - g_diag_arm_us[num]),
+                  g_diag_win_lines == DIAG_WIN_MAX_LINES ? " (trace line limit reached)" : "");
+    } else {
+        diag_logf("[usb] t=%lu.%03lu ep 0x%02x ARM len=%lu%s\r\n", (unsigned long)(us / 1000u),
+                  (unsigned long)(us % 1000u), ep_addr, (unsigned long)len,
+                  g_diag_win_lines == DIAG_WIN_MAX_LINES ? " (trace line limit reached)" : "");
+    }
+}
 #endif
 
 /* The SETUP packet is already in the control FIFO when its interrupt fires, so
@@ -653,6 +767,7 @@ void dcd_connect(uint8_t rhport)
 {
     (void)rhport;
     g_want_connected = true;
+    DIAG(g_diag_disc_ms = 0; ev_push(false, EV_CONNECT, 0, 0, diag_cnt.usb_disc_caller));
     if (g_started) {
         apply_connect(true);
     }
@@ -662,6 +777,9 @@ void dcd_disconnect(uint8_t rhport)
 {
     (void)rhport;
     g_want_connected = false;
+    DIAG(uint32_t const t = (uint32_t)bflb_mtimer_get_time_ms(); g_diag_disc_ms = t != 0 ? t : 1;
+         g_diag_disc_while_configured = g_diag_configured;
+         ev_push(false, EV_DISCONNECT, 0, g_diag_configured ? 1 : 0, diag_cnt.usb_disc_caller));
     if (g_started) {
         apply_connect(false);
     }
@@ -717,6 +835,26 @@ static bool ep_configure(tusb_desc_endpoint_t const *desc)
     uint32_t regval = getreg32(BFLB_USB_BASE + USB_DEV_ADR_OFFSET);
     regval |= USB_AFT_CONF;
     putreg32(regval, BFLB_USB_BASE + USB_DEV_ADR_OFFSET);
+#if DS5_BL616_DIAG_LOG
+    {
+        static const char *const type_names[4] = {"control", "iso", "bulk", "interrupt"};
+        bool const in = tu_edpt_dir(ep_addr) == TUSB_DIR_IN;
+        uint8_t const fifo = (uint8_t)(ep_idx - 1);
+        uint32_t const interval_us = port_speed() == TUSB_SPEED_HIGH ? (125u << (desc->bInterval ? desc->bInterval - 1 : 0))
+                                                                    : 1000u * desc->bInterval;
+        ev_push(false, EV_OPEN, ep_addr, mps, (uint32_t)type | ((uint32_t)desc->bInterval << 8));
+        diag_logf("[usb] t=%lu open ep 0x%02x %s %s mps=%u bInterval=%u (%lu us at %s speed) -> FIFO F%u, 512 B x1 block;"
+                  " regs: fcfg=0x%08lx fmap=0x%08lx epmap0=0x%08lx %smps%u=0x%08lx fibc%u=0x%08lx vdma_f%ups1=0x%08lx\r\n",
+                  (unsigned long)bflb_mtimer_get_time_ms(), ep_addr, in ? "IN" : "OUT", type_names[type & 3u], mps,
+                  desc->bInterval, (unsigned long)interval_us, speed_name(port_speed()), fifo,
+                  (unsigned long)getreg32(BFLB_USB_BASE + USB_DEV_FCFG_OFFSET),
+                  (unsigned long)getreg32(BFLB_USB_BASE + USB_DEV_FMAP_OFFSET),
+                  (unsigned long)getreg32(BFLB_USB_BASE + USB_DEV_EPMAP0_OFFSET), in ? "in" : "out", ep_idx,
+                  (unsigned long)getreg32(BFLB_USB_BASE + (in ? USB_DEV_INMPS1_OFFSET : USB_DEV_OUTMPS1_OFFSET) + (ep_idx - 1) * 4),
+                  fifo, (unsigned long)getreg32(BFLB_USB_BASE + USB_DEV_FIBC0_OFFSET + 4 * fifo), fifo,
+                  (unsigned long)getreg32(BFLB_USB_BASE + USB_VDMA_F0PS1_OFFSET + fifo * 8));
+    }
+#endif
     return true;
 }
 
@@ -743,6 +881,7 @@ bool dcd_edpt_iso_activate(uint8_t rhport, tusb_desc_endpoint_t const *desc_ep)
 void dcd_edpt_close_all(uint8_t rhport)
 {
     (void)rhport;
+    DIAG(ev_push(false, EV_CLOSE_ALL, 0, 0, 0));
     for (uint8_t i = 1; i < EP_COUNT; i++) {
         ep_in[i].enable = false;
         ep_in[i].active = false;
@@ -797,6 +936,7 @@ bool dcd_edpt_xfer(uint8_t rhport, uint8_t ep_addr, uint8_t *buffer, uint16_t to
     ep->buf = buffer;
     ep->len = total_bytes;
     ep->active = true;
+    DIAG(diag_iso_trace(false, ep_addr, total_bytes, total_bytes));
     if (in) {
         if (total_bytes == 0) {
             send_zlp(ep_idx); /* completes on the TX0BYTE interrupt */
@@ -828,6 +968,7 @@ void dcd_edpt_stall(uint8_t rhport, uint8_t ep_addr)
     if (!g_started) {
         return;
     }
+    DIAG(ev_push(false, EV_STALL, ep_addr, 0, 0));
     if (ep_idx == 0) {
         regval = getreg32(BFLB_USB_BASE + USB_DEV_CXCFE_OFFSET);
         regval |= USB_CX_STL;
@@ -852,6 +993,7 @@ void dcd_edpt_clear_stall(uint8_t rhport, uint8_t ep_addr)
     if (!g_started || ep_idx == 0) {
         return;
     }
+    DIAG(ev_push(false, EV_CLEAR_STALL, ep_addr, 0, 0));
     if (tu_edpt_dir(ep_addr) == TUSB_DIR_OUT) {
         regval = getreg32(BFLB_USB_BASE + USB_DEV_OUTMPS1_OFFSET + (ep_idx - 1) * 4);
         regval &= ~USB_STL_OEP1;
@@ -874,6 +1016,8 @@ static void diag_usb_setup(const uint8_t *s)
     const uint16_t index = (uint16_t)(s[4] | (s[5] << 8));
     diag_cnt.usb_setup++;
     diag_note_usb_isr(1, s);
+    g_diag_suspended = false;
+    ev_push(false, EV_SETUP, 0, (uint16_t)(type | (req << 8)), (uint32_t)value | ((uint32_t)index << 16));
     if (g_speed_after_reset_pending) {
         /* The bus reset interrupt may come before the high-speed chirp has
          * finished; by the first SETUP the speed is settled. TinyUSB keeps the
@@ -890,10 +1034,44 @@ static void diag_usb_setup(const uint8_t *s)
         diag_logf("[usb] t=%lu SET_ADDRESS %u\r\n", (unsigned long)t, value);
     } else if (type == 0x00 && req == 0x09) {
         diag_logf("[usb] t=%lu SET_CONFIGURATION %u\r\n", (unsigned long)t, value);
+        g_diag_configured = value != 0;
+        g_diag_last_irq_ms = t;
+        diag_cnt.stream_alt[1] = 0;
+        diag_cnt.stream_alt[2] = 0;
     } else if (type == 0x01 && req == 0x0B) {
         diag_logf("[usb] t=%lu SET_INTERFACE itf %u alt %u\r\n", (unsigned long)t, index, value);
+        if (index == 1 || index == 2) {
+            diag_note_stream_alt((uint8_t)index, (uint8_t)value);
+            if (value != 0) {
+                /* A stream opens: trace EP1/EP2 for the next 200 ms. */
+                g_diag_win_until_ms = t + DIAG_WIN_MS;
+                g_diag_win_lines = 0;
+                g_diag_win_first[1] = DIAG_WIN_FIRST;
+                g_diag_win_first[2] = DIAG_WIN_FIRST;
+                diag_logf("[usb] t=%lu %s stream opening: tracing ep 0x01/0x82 transfers for %u ms (at most %u lines);"
+                          " TinyUSB opens the endpoint when it handles this request\r\n",
+                          (unsigned long)t, index == 1 ? "speaker" : "microphone", (unsigned)DIAG_WIN_MS,
+                          (unsigned)DIAG_WIN_MAX_LINES);
+            }
+        }
     } else if (type == 0x21 && req == 0x09) {
         diag_cnt.usb_set_report[value & 0xFF]++;
+    } else if ((type & 0x7F) == 0x22) {
+        /* Audio class request to an endpoint (UAC1 sampling frequency). */
+        diag_logf("[usb] t=%lu class request to endpoint 0x%02x: bmRequestType 0x%02x bRequest 0x%02x wValue 0x%04x wLength %u\r\n",
+                  (unsigned long)t, index & 0xFF, type, req, value, (unsigned)(s[6] | (s[7] << 8)));
+    } else if ((type & 0x7F) == 0x21 && (index & 0xFF) != 3) {
+        /* Audio class request to an interface or entity (mute, volume),
+         * rate-limited: the HID interface (3) is counted above instead. */
+        static uint32_t window_ms, lines;
+        if (t - window_ms >= 5000u) {
+            window_ms = t;
+            lines = 0;
+        }
+        if (lines++ < 12u) {
+            diag_logf("[usb] t=%lu class request to itf/entity 0x%04x: bmRequestType 0x%02x bRequest 0x%02x wValue 0x%04x wLength %u\r\n",
+                      (unsigned long)t, index, type, req, value, (unsigned)(s[6] | (s[7] << 8)));
+        }
     }
 }
 
@@ -920,6 +1098,198 @@ void bl616_dcd_diag_waits(uint32_t *timeouts, uint32_t *cx_preempted)
     *timeouts = g_wait_timeouts;
     *cx_preempted = g_cx_vdma_preempted;
 }
+
+/* Variant P. Called by the monitor task every 250 ms. The host is "talking"
+ * while USB device interrupts keep coming (EP4's input reports alone complete
+ * about 250 times a second at high speed) or the SOF frame number keeps
+ * changing. The frame number counts only if it has been seen to change at least
+ * once since the configuration: a register that never moves would otherwise
+ * read as silence. Returns 0, or the reset reason with why filled in. */
+#define DIAG_SILENT_MS 2000u
+
+uint32_t bl616_dcd_diag_check_silence(uint32_t now, char *why, uint32_t cap)
+{
+    if (!g_started) {
+        return 0;
+    }
+    if (!g_want_connected) {
+        /* The firmware took the device off the bus itself (tud_disconnect). */
+        uint32_t const since = g_diag_disc_ms;
+        if (since != 0 && g_diag_disc_while_configured && (uint32_t)(now - since) >= DIAG_SILENT_MS) {
+            snprintf(why, cap,
+                     "the firmware disconnected USB itself (D+ pull-up off) %lu ms ago while configured, caller 0x%08lx,"
+                     " and has not reconnected; audio alts itf1=%u itf2=%u, last alt change %lu ms ago",
+                     (unsigned long)(now - since), (unsigned long)diag_cnt.usb_disc_caller,
+                     (unsigned)diag_cnt.stream_alt[1], (unsigned)diag_cnt.stream_alt[2],
+                     (unsigned long)(diag_cnt.stream_alt_ms ? now - diag_cnt.stream_alt_ms : 0));
+            return DIAG_RESET_USB_SILENT;
+        }
+        return 0;
+    }
+    if (!g_diag_configured) {
+        g_diag_sfn_sampled = false;
+        g_diag_sfn_moving = false;
+        g_diag_suspend_noted = false;
+        return 0;
+    }
+    uint32_t const sfn = getreg32(BFLB_USB_BASE + USB_DEV_SFN_OFFSET) & (USB_SOFN_MASK | USB_USOFN_MASK);
+    if (!g_diag_sfn_sampled) {
+        g_diag_sfn_sampled = true;
+        g_diag_sfn_last = sfn;
+        g_diag_sfn_change_ms = now;
+    } else if (sfn != g_diag_sfn_last) {
+        g_diag_sfn_last = sfn;
+        g_diag_sfn_change_ms = now;
+        g_diag_sfn_moving = true;
+    }
+    uint32_t const irq_age = now - g_diag_last_irq_ms;
+    uint32_t const sof_age = now - g_diag_sfn_change_ms;
+    bool silent;
+    const char *basis;
+    if (g_diag_sfn_moving) {
+        silent = irq_age >= DIAG_SILENT_MS && sof_age >= DIAG_SILENT_MS;
+        basis = "no USB interrupt and no SOF frame-number change";
+    } else {
+        /* The frame number has not been seen moving (could not look): the
+         * interrupts alone decide, except in keyboard-only mode, where nothing
+         * completes until a key is sent. */
+        silent = irq_age >= DIAG_SILENT_MS && !usb_keyboard_only;
+        basis = "no USB interrupt (the SOF frame number was never seen moving, so it was not used)";
+    }
+    if (!silent) {
+        g_diag_suspend_noted = false;
+        return 0;
+    }
+    bool const stream_open = diag_cnt.stream_alt[1] != 0 || diag_cnt.stream_alt[2] != 0;
+    if (g_diag_suspended && !stream_open) {
+        if (!g_diag_suspend_noted) {
+            g_diag_suspend_noted = true;
+            diag_logf("[usb] t=%lu silent %lu ms while suspended with no audio stream open: a host suspend, not reset\r\n",
+                      (unsigned long)now, (unsigned long)irq_age);
+        }
+        return 0;
+    }
+    snprintf(why, cap,
+             "%s for %lu ms (last interrupt %lu ms ago, frame number 0x%04lx unchanged %lu ms) while configured%s;"
+             " audio alts itf1=%u itf2=%u, last alt change %lu ms ago",
+             basis, (unsigned long)(irq_age < sof_age || !g_diag_sfn_moving ? irq_age : sof_age),
+             (unsigned long)irq_age, (unsigned long)sfn, (unsigned long)sof_age,
+             g_diag_suspended ? ", suspended WITH a stream open" : "", (unsigned)diag_cnt.stream_alt[1],
+             (unsigned)diag_cnt.stream_alt[2],
+             (unsigned long)(diag_cnt.stream_alt_ms ? now - diag_cnt.stream_alt_ms : 0));
+    return DIAG_RESET_USB_SILENT;
+}
+
+static void dump_events(const char *title, const struct diag_usb_evt *ring, uint32_t count)
+{
+    uint32_t const n = count < DIAG_EVT_N ? count : DIAG_EVT_N;
+    diag_logf("[usbdump] %s: last %lu of %lu\r\n", title, (unsigned long)n, (unsigned long)count);
+    char line[200];
+    size_t len = 0;
+    line[0] = '\0';
+    for (uint32_t i = count - n; i != count; i++) {
+        const struct diag_usb_evt *e = &ring[i % DIAG_EVT_N];
+        char tok[64];
+        int k;
+        if (e->kind == EV_SETUP) {
+            k = snprintf(tok, sizeof(tok), " %lu:SETUP %02x/%02x v%04lx i%04lx", (unsigned long)e->t_ms,
+                         e->a & 0xFF, e->a >> 8, (unsigned long)(e->b & 0xFFFF), (unsigned long)(e->b >> 16));
+        } else {
+            k = snprintf(tok, sizeof(tok), " %lu:%s ep%02x a=%u b=0x%lx", (unsigned long)e->t_ms, ev_name(e->kind),
+                         e->ep, e->a, (unsigned long)e->b);
+        }
+        if (k <= 0) {
+            continue;
+        }
+        if (len + (size_t)k + 3 >= sizeof(line)) {
+            diag_logf("[usbdump]%s\r\n", line);
+            len = 0;
+            line[0] = '\0';
+        }
+        memcpy(line + len, tok, (size_t)k + 1);
+        len += (size_t)k;
+    }
+    if (len != 0) {
+        diag_logf("[usbdump]%s\r\n", line);
+    }
+}
+
+#define R(off) ((unsigned long)getreg32(BFLB_USB_BASE + (off)))
+
+void bl616_dcd_diag_dump(const char *why)
+{
+    uint32_t const now = (uint32_t)bflb_mtimer_get_time_ms();
+    diag_logf("[usbdump] t=%lu USB state (%s)\r\n", (unsigned long)now, why != NULL ? why : "");
+    diag_logf("[usbdump] started=%d want_connected=%d int_enabled=%d configured=%d suspended=%d speed=%s"
+              " last_irq=%lu ms ago disc_at=%lu ms (while configured %d) disc_caller=0x%08lx\r\n",
+              g_started, g_want_connected, g_int_enabled, g_diag_configured, g_diag_suspended,
+              g_started ? speed_name(port_speed()) : "-", (unsigned long)(now - g_diag_last_irq_ms),
+              (unsigned long)g_diag_disc_ms, g_diag_disc_while_configured, (unsigned long)diag_cnt.usb_disc_caller);
+    diag_logf("[usbdump] sof_moving=%d sfn_last=0x%04lx changed %lu ms ago wait_timeouts=%lu setup_preempted=%lu\r\n",
+              g_diag_sfn_moving, (unsigned long)g_diag_sfn_last, (unsigned long)(now - g_diag_sfn_change_ms),
+              (unsigned long)g_wait_timeouts, (unsigned long)g_cx_vdma_preempted);
+    for (int i = 0; i < EP_COUNT; i++) {
+        diag_logf("[usbdump] ep%d in: mps=%u type=%u enable=%d active=%d len=%u buf=%p | out: mps=%u type=%u enable=%d"
+                  " active=%d len=%u buf=%p\r\n",
+                  i, ep_in[i].mps, ep_in[i].type, ep_in[i].enable, ep_in[i].active, ep_in[i].len, (void *)ep_in[i].buf,
+                  ep_out[i].mps, ep_out[i].type, ep_out[i].enable, ep_out[i].active, ep_out[i].len,
+                  (void *)ep_out[i].buf);
+    }
+    if (!g_started) {
+        diag_logf("[usbdump] controller not started: registers not read\r\n");
+    } else {
+        diag_logf("[usbdump] otg_csr=0x%08lx otg_isr=0x%08lx glb_isr=0x%08lx glb_int=0x%08lx dev_ctl=0x%08lx dev_adr=0x%08lx"
+                  " dev_tst=0x%08lx dev_sfn=0x%08lx dev_smt=0x%08lx phy_tst=0x%08lx (unplug=%lu) hcmisc=0x%08lx\r\n",
+                  R(USB_OTG_CSR_OFFSET), R(USB_OTG_ISR_OFFSET), R(USB_GLB_ISR_OFFSET), R(USB_GLB_INT_OFFSET),
+                  R(USB_DEV_CTL_OFFSET), R(USB_DEV_ADR_OFFSET), R(USB_DEV_TST_OFFSET), R(USB_DEV_SFN_OFFSET),
+                  R(USB_DEV_SMT_OFFSET), R(USB_PHY_TST_OFFSET), R(USB_PHY_TST_OFFSET) & USB_UNPLUG,
+                  R(USB_HCMISC_OFFSET));
+        diag_logf("[usbdump] igr=0x%08lx migr=0x%08lx isg0=0x%08lx/m0x%08lx isg1=0x%08lx/m0x%08lx isg2=0x%08lx/m0x%08lx\r\n",
+                  R(USB_DEV_IGR_OFFSET), R(USB_DEV_MIGR_OFFSET), R(USB_DEV_ISG0_OFFSET), R(USB_DEV_MISG0_OFFSET),
+                  R(USB_DEV_ISG1_OFFSET), R(USB_DEV_MISG1_OFFSET), R(USB_DEV_ISG2_OFFSET), R(USB_DEV_MISG2_OFFSET));
+        diag_logf("[usbdump] isg3=0x%08lx/m0x%08lx isg4=0x%08lx rxz=0x%08lx txz=0x%08lx ise=0x%08lx cxcfe=0x%08lx\r\n",
+                  R(USB_DEV_ISG3_OFFSET), R(USB_DEV_MISG3_OFFSET), R(USB_DEV_ISG4_OFFSET), R(USB_DEV_RXZ_OFFSET),
+                  R(USB_DEV_TXZ_OFFSET), R(USB_DEV_ISE_OFFSET), R(USB_DEV_CXCFE_OFFSET));
+        diag_logf("[usbdump] epmap0=0x%08lx fmap=0x%08lx fcfg=0x%08lx fibc0-3=0x%08lx 0x%08lx 0x%08lx 0x%08lx\r\n",
+                  R(USB_DEV_EPMAP0_OFFSET), R(USB_DEV_FMAP_OFFSET), R(USB_DEV_FCFG_OFFSET), R(USB_DEV_FIBC0_OFFSET),
+                  R(USB_DEV_FIBC1_OFFSET), R(USB_DEV_FIBC2_OFFSET), R(USB_DEV_FIBC3_OFFSET));
+        diag_logf("[usbdump] inmps1-4=0x%08lx 0x%08lx 0x%08lx 0x%08lx outmps1-4=0x%08lx 0x%08lx 0x%08lx 0x%08lx\r\n",
+                  R(USB_DEV_INMPS1_OFFSET), R(USB_DEV_INMPS2_OFFSET), R(USB_DEV_INMPS3_OFFSET),
+                  R(USB_DEV_INMPS4_OFFSET), R(USB_DEV_OUTMPS1_OFFSET), R(USB_DEV_OUTMPS2_OFFSET),
+                  R(USB_DEV_OUTMPS3_OFFSET), R(USB_DEV_OUTMPS4_OFFSET));
+        diag_logf("[usbdump] vdma_ctrl=0x%08lx cxf ps1=0x%08lx ps2=0x%08lx | f0 0x%08lx 0x%08lx | f1 0x%08lx 0x%08lx"
+                  " | f2 0x%08lx 0x%08lx | f3 0x%08lx 0x%08lx\r\n",
+                  R(USB_VDMA_CTRL_OFFSET), R(USB_VDMA_CXFPS1_OFFSET), R(USB_VDMA_CXFPS2_OFFSET),
+                  R(USB_VDMA_F0PS1_OFFSET), R(USB_VDMA_F0PS2_OFFSET), R(USB_VDMA_F1PS1_OFFSET),
+                  R(USB_VDMA_F1PS2_OFFSET), R(USB_VDMA_F2PS1_OFFSET), R(USB_VDMA_F2PS2_OFFSET),
+                  R(USB_VDMA_F3PS1_OFFSET), R(USB_VDMA_F3PS2_OFFSET));
+    }
+    diag_logf("[usbdump] totals: setup=%lu resets=%lu suspends=%lu resumes=%lu done/armed in0 %lu/%lu out0 %lu/%lu"
+              " out1 %lu/%lu in2 %lu/%lu out3 %lu/%lu in4 %lu/%lu iso_out short=%lu zero=%lu\r\n",
+              (unsigned long)diag_cnt.usb_setup, (unsigned long)diag_cnt.usb_bus_reset,
+              (unsigned long)diag_cnt.usb_suspend, (unsigned long)diag_cnt.usb_resume,
+              (unsigned long)diag_cnt.usb_done_in[0], (unsigned long)diag_cnt.usb_armed_in[0],
+              (unsigned long)diag_cnt.usb_done_out[0], (unsigned long)diag_cnt.usb_armed_out[0],
+              (unsigned long)diag_cnt.usb_done_out[1], (unsigned long)diag_cnt.usb_armed_out[1],
+              (unsigned long)diag_cnt.usb_done_in[2], (unsigned long)diag_cnt.usb_armed_in[2],
+              (unsigned long)diag_cnt.usb_done_out[3], (unsigned long)diag_cnt.usb_armed_out[3],
+              (unsigned long)diag_cnt.usb_done_in[4], (unsigned long)diag_cnt.usb_armed_in[4],
+              (unsigned long)diag_cnt.usb_iso_out_short, (unsigned long)diag_cnt.usb_iso_out_zero);
+    /* Copies, so the rings are not read while the interrupt writes them. */
+    static struct diag_usb_evt copy[DIAG_EVT_N];
+    uintptr_t flags = bflb_irq_save();
+    uint32_t const nc = g_ev_ctl_n;
+    memcpy(copy, g_ev_ctl, sizeof(copy));
+    bflb_irq_restore(flags);
+    dump_events("bus/control events (time ms:event)", copy, nc);
+    flags = bflb_irq_save();
+    uint32_t const nd = g_ev_dat_n;
+    memcpy(copy, g_ev_dat, sizeof(copy));
+    bflb_irq_restore(flags);
+    dump_events("ep1/ep2 data events (ARM a=len, DONE a=len b=armed len)", copy, nd);
+}
+
+#undef R
 #endif
 
 /* ---------------------------------------------------------------- interrupt */
@@ -931,7 +1301,13 @@ static void complete_out(uint8_t ep_addr, ep_state_t *ep, uint32_t len)
         bflb_l1c_dcache_invalidate_range(ep->buf, len);
     }
     DIAG(diag_cnt.usb_done_out[ep_addr & 0x0F]++;
-         if ((ep_addr & 0x0F) == 3 && len != 0 && ep->buf != NULL) { diag_cnt.usb_out_report[ep->buf[0]]++; });
+         if ((ep_addr & 0x0F) == 3 && len != 0 && ep->buf != NULL) { diag_cnt.usb_out_report[ep->buf[0]]++; }
+         if ((ep_addr & 0x0F) == 1) {
+             if (len < ep->len) { diag_cnt.usb_iso_out_short++; }
+             if (len < diag_cnt.usb_iso_out_min) { diag_cnt.usb_iso_out_min = len; }
+             if (len > diag_cnt.usb_iso_out_max) { diag_cnt.usb_iso_out_max = len; }
+         }
+         diag_iso_trace(true, ep_addr, len, ep->len));
     dcd_event_xfer_complete(0, ep_addr, len, XFER_RESULT_SUCCESS, true);
 }
 
@@ -944,6 +1320,7 @@ void dcd_int_handler(uint8_t rhport)
     }
     uint32_t const dev_intstatus = getreg32(BFLB_USB_BASE + USB_DEV_IGR_OFFSET);
     uint32_t status;
+    DIAG(g_diag_last_irq_ms = (uint32_t)bflb_mtimer_get_time_ms());
 
     if (dev_intstatus & USB_INT_G0) {
         status = group_intstatus(0);
@@ -975,6 +1352,7 @@ void dcd_int_handler(uint8_t rhport)
                 vdma_stop(USB_FIFO_CXF);
                 reset_fifo(USB_FIFO_CXF);
                 group_int_clear(3, USB_VDMA_CMPLT_CXF);
+                DIAG(ev_push(false, EV_SETUP_TIMEOUT, 0, 0, g_wait_timeouts));
                 uint32_t const cx = getreg32(BFLB_USB_BASE + USB_DEV_CXCFE_OFFSET);
                 putreg32(cx | USB_CX_STL, BFLB_USB_BASE + USB_DEV_CXCFE_OFFSET);
             }
@@ -986,7 +1364,8 @@ void dcd_int_handler(uint8_t rhport)
 
         if (status & USB_SUSP_INT) {
             group_int_clear(2, USB_SUSP_INT);
-            DIAG(diag_cnt.usb_suspend++; diag_logf("[usb] t=%lu suspend\r\n", (unsigned long)bflb_mtimer_get_time_ms()));
+            DIAG(diag_cnt.usb_suspend++; g_diag_suspended = true; ev_push(false, EV_SUSPEND, 0, 0, 0);
+                 diag_logf("[usb] t=%lu suspend\r\n", (unsigned long)bflb_mtimer_get_time_ms()));
             /* Unlike the SDK driver, the FIFOs are NOT reset here: TinyUSB
              * keeps an endpoint busy until its transfer completes, so a report
              * dropped on suspend would leave that endpoint stuck after resume.
@@ -995,7 +1374,8 @@ void dcd_int_handler(uint8_t rhport)
         }
         if (status & USB_RESM_INT) {
             group_int_clear(2, USB_RESM_INT);
-            DIAG(diag_cnt.usb_resume++; diag_logf("[usb] t=%lu resume\r\n", (unsigned long)bflb_mtimer_get_time_ms()));
+            DIAG(diag_cnt.usb_resume++; g_diag_suspended = false; ev_push(false, EV_RESUME, 0, 0, 0);
+                 diag_logf("[usb] t=%lu resume\r\n", (unsigned long)bflb_mtimer_get_time_ms()));
             dcd_event_bus_signal(0, DCD_EVENT_RESUME, true);
         }
         if (status & USB_TX0BYTE_INT) {
@@ -1004,7 +1384,7 @@ void dcd_int_handler(uint8_t rhport)
                 if (txz & (1u << (i - 1))) {
                     putreg32((1u << (i - 1)), BFLB_USB_BASE + USB_DEV_TXZ_OFFSET);
                     ep_in[i].active = false;
-                    DIAG(diag_cnt.usb_done_in[i]++);
+                    DIAG(diag_cnt.usb_done_in[i]++; diag_iso_trace(true, (uint8_t)(i | TUSB_DIR_IN_MASK), 0, 0));
                     dcd_event_xfer_complete(0, (uint8_t)(i | TUSB_DIR_IN_MASK), 0, XFER_RESULT_SUCCESS, true);
                 }
             }
@@ -1015,9 +1395,26 @@ void dcd_int_handler(uint8_t rhport)
             for (uint8_t i = 1; i < EP_COUNT; i++) {
                 if (rxz & (1u << (i - 1))) {
                     putreg32((1u << (i - 1)), BFLB_USB_BASE + USB_DEV_RXZ_OFFSET);
-                    if (ep_out[i].active) {
-                        complete_out(i, &ep_out[i], 0);
+                    DIAG(ev_push(true, EV_ZLP_RX, i, ep_out[i].active ? 1 : 0, ep_out[i].type);
+                         if (i == 1) { diag_cnt.usb_iso_out_zero++; });
+                    if (!ep_out[i].active) {
+                        continue;
                     }
+                    if (ep_out[i].type == TUSB_XFER_ISOCHRONOUS) {
+                        /* An empty isochronous packet carries no samples. Keep
+                         * the transfer armed for the next packet: completing it
+                         * with 0 bytes made TinyUSB's audio driver stop
+                         * re-arming the endpoint (audiod_rx_xfer_isr returns
+                         * before its next usbd_edpt_xfer when it writes 0
+                         * bytes), and left this VDMA running underneath a
+                         * transfer TinyUSB considered finished. */
+                        continue;
+                    }
+                    /* Stop the VDMA armed for this transfer before it is
+                     * reported done, so TinyUSB's next transfer does not
+                     * reprogram a channel that is still running. */
+                    vdma_stop((uint8_t)(i - 1));
+                    complete_out(i, &ep_out[i], 0);
                 }
             }
             group_int_clear(2, USB_RX0BYTE_INT);
@@ -1036,7 +1433,9 @@ void dcd_int_handler(uint8_t rhport)
 
             ep0_reset_state();
             tusb_speed_t const speed = port_speed();
-            DIAG(diag_cnt.usb_bus_reset++; g_speed_after_reset_pending = true;
+            DIAG(diag_cnt.usb_bus_reset++; g_speed_after_reset_pending = true; g_diag_configured = false;
+                 g_diag_suspended = false; diag_cnt.stream_alt[1] = 0; diag_cnt.stream_alt[2] = 0;
+                 ev_push(false, EV_BUS_RESET, 0, (uint16_t)speed, 0);
                  diag_logf("[usb] t=%lu bus reset, %s speed told to TinyUSB (otg_csr=0x%08lx spd_typ=%lu, dev_ctl=0x%08lx hs_en=%lu force_fs=%lu)\r\n",
                            (unsigned long)bflb_mtimer_get_time_ms(), speed_name(speed),
                            (unsigned long)getreg32(BFLB_USB_BASE + USB_OTG_CSR_OFFSET),
@@ -1073,7 +1472,8 @@ void dcd_int_handler(uint8_t rhport)
                 if (ep_in[ep_idx].active) {
                     ep_in[ep_idx].active = false;
                     uint32_t const n = ep_in[ep_idx].len - vdma_remain(fifo);
-                    DIAG(diag_cnt.usb_done_in[ep_idx]++);
+                    DIAG(diag_cnt.usb_done_in[ep_idx]++;
+                         diag_iso_trace(true, (uint8_t)(ep_idx | TUSB_DIR_IN_MASK), n, ep_in[ep_idx].len));
                     dcd_event_xfer_complete(0, (uint8_t)(ep_idx | TUSB_DIR_IN_MASK), n, XFER_RESULT_SUCCESS, true);
                 } else if (ep_out[ep_idx].active) {
                     uint32_t const n = ep_out[ep_idx].len - vdma_remain(fifo);

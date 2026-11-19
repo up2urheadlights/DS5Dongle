@@ -63,6 +63,35 @@ DIAG_WRAP_VOID(_Z16battery_led_tickv, DIAG_WHERE_BATT_LED)
 DIAG_WRAP_VOID(_Z12button_checkv, DIAG_WHERE_BUTTON_CHECK)
 DIAG_WRAP_VOID(_Z16bt_inquiring_ledv, DIAG_WHERE_INQUIRY_LED)
 
+/* Variant P: who takes the device off the bus. bt.cpp hides the USB device on
+ * every Bluetooth disconnection (unless wake is on or the host is suspended),
+ * and usb.cpp, main.cpp and wake.cpp disconnect it too; from the host's side
+ * each of them looks like "the adapter stopped answering". The caller's return
+ * address can be looked up in the build's .map or with addr2line. */
+#include "bflb_mtimer.h"
+
+bool __real_tud_disconnect(void);
+bool __wrap_tud_disconnect(void);
+bool __wrap_tud_disconnect(void)
+{
+    const uint32_t ra = (uint32_t)(uintptr_t)__builtin_return_address(0);
+    diag_cnt.usb_disc_caller = ra;
+    diag_logf("[usb] t=%lu tud_disconnect() called from 0x%08lx: D+ pull-up off, the host sees the device removed\r\n",
+              (unsigned long)bflb_mtimer_get_time_ms(), (unsigned long)ra);
+    return __real_tud_disconnect();
+}
+
+bool __real_tud_connect(void);
+bool __wrap_tud_connect(void);
+bool __wrap_tud_connect(void)
+{
+    const uint32_t ra = (uint32_t)(uintptr_t)__builtin_return_address(0);
+    diag_cnt.usb_disc_caller = ra;
+    diag_logf("[usb] t=%lu tud_connect() called from 0x%08lx\r\n", (unsigned long)bflb_mtimer_get_time_ms(),
+              (unsigned long)ra);
+    return __real_tud_connect();
+}
+
 /* tud_task() is an inline wrapper around tud_task_ext() (TinyUSB usbd.h). */
 void __real_tud_task_ext(uint32_t timeout_ms, bool in_isr);
 void __wrap_tud_task_ext(uint32_t timeout_ms, bool in_isr);

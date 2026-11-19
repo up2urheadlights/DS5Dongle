@@ -134,6 +134,13 @@ uint16_t g_diag_handle = 0xFFFF; // the ACL link whose free slots are reported
 uint32_t g_diag_evt_window_ms = 0;
 uint32_t g_diag_evt_lines = 0;
 constexpr uint32_t kDiagEvtLinesPer5s = 40;
+// Variant P: after an audio stream opens, the next outgoing audio reports (and
+// their continuation fragments) and the completed-packet events are logged.
+uint32_t g_diag_audio_acl_since_alt = 0;
+uint32_t g_diag_audio_log_left = 0;
+uint32_t g_diag_nocp_log_left = 0;
+uint32_t g_diag_alt_seen_ms = 0;
+bool g_diag_in_audio_report = false;
 
 void diag_on_rx(const uint8_t *h4, uint32_t len) {
     const uint8_t type = h4[0];
@@ -150,18 +157,72 @@ void diag_on_rx(const uint8_t *h4, uint32_t len) {
     ++diag_cnt.bt_evt_in;
     diag_note_bt_rx(type, code);
 
+    const uint32_t now = port::now_ms();
     if (code == 0x03 && plen >= 3) { // Connection Complete: status, handle
         g_diag_connected_once = true;
         if (prm[0] == 0) g_diag_handle = little_endian_read_16(prm, 1) & 0x0FFF;
     } else if (code == 0x05 && plen >= 3) { // Disconnection Complete
         if ((little_endian_read_16(prm, 1) & 0x0FFF) == g_diag_handle) g_diag_handle = 0xFFFF;
+        // Variant P: the reason survives a reset, and a drop that follows an
+        // audio alt-setting change within 5 s resets the chip so the log
+        // around it can be read (USB is hidden after a disconnection).
+        if (plen >= 4) {
+            const uint8_t reason = prm[3];
+            diag_note_bt_disconnect(reason);
+            const uint32_t alt_ms = diag_cnt.stream_alt_ms;
+            if (alt_ms != 0 && now - alt_ms <= 5000) {
+                static char why[200];
+                snprintf(why, sizeof(why),
+                         "HCI Disconnection Complete status 0x%02X handle 0x%03X reason 0x%02X, %lu ms after the audio"
+                         " SET_INTERFACE (itf1 alt %u, itf2 alt %u); %lu audio ACL packets sent since",
+                         prm[0], little_endian_read_16(prm, 1) & 0x0FFF, reason, (unsigned long) (now - alt_ms),
+                         (unsigned) diag_cnt.stream_alt[1], (unsigned) diag_cnt.stream_alt[2],
+                         (unsigned long) g_diag_audio_acl_since_alt);
+                diag_request_reset(DIAG_RESET_BT_DROP, 400, why);
+            }
+        }
+    } else if (code == 0x13 && plen >= 1) { // Number Of Completed Packets
+        uint32_t sum = 0;
+        const uint32_t handles = prm[0];
+        for (uint32_t i = 0; i < handles && 1 + 4 * i + 4 <= plen; i++) {
+            sum += little_endian_read_16(prm, 1 + 4 * i + 2);
+        }
+        ++diag_cnt.bt_nocp_events;
+        diag_cnt.bt_nocp_packets += sum;
+        if (g_diag_nocp_log_left > 0) {
+            --g_diag_nocp_log_left;
+            diag_logf("[bt] t=%lu.%03lu Number Of Completed Packets: %lu handle(s), %lu packet(s) returned"
+                      " (totals %lu events / %lu packets)\r\n",
+                      (unsigned long) (port::now_us32() / 1000), (unsigned long) (port::now_us32() % 1000),
+                      (unsigned long) handles, (unsigned long) sum, (unsigned long) diag_cnt.bt_nocp_events,
+                      (unsigned long) diag_cnt.bt_nocp_packets);
+        }
+    }
+    if (code == 0x0E && plen >= 4 && prm[3] == 0) {
+        const uint16_t op = little_endian_read_16(prm, 1);
+        if (op == 0x1005 && plen >= 11) { // Read_Buffer_Size
+            const uint16_t acl_len = little_endian_read_16(prm, 4);
+            const uint16_t acl_num = little_endian_read_16(prm, 7);
+            const uint16_t used = acl_len < HCI_ACL_PAYLOAD_SIZE ? acl_len : HCI_ACL_PAYLOAD_SIZE;
+            diag_logf("[hci] t=%lu Read_Buffer_Size: controller ACL length %u x %u buffers, SCO length %u x %u;"
+                      " BTstack sends at most %u payload bytes per ACL packet (HCI_ACL_PAYLOAD_SIZE %u,"
+                      " fragments cut to a multiple of %u), so a 0x39 audio report (552 B of L2CAP) goes as %s\r\n",
+                      (unsigned long) now, acl_len, acl_num, prm[6], little_endian_read_16(prm, 9), used,
+                      (unsigned) HCI_ACL_PAYLOAD_SIZE, (unsigned) HCI_ACL_CHUNK_SIZE_ALIGNMENT,
+                      used >= 552 ? "ONE packet" : "SEVERAL fragments (pb=0x01 continuations)");
+        } else if (op == 0x1003 && plen >= 12) { // Read_Local_Supported_Features
+            const uint8_t *f = &prm[4];
+            diag_logf("[hci] t=%lu local LMP features %02X %02X %02X %02X %02X %02X %02X %02X: 3-slot=%u 5-slot=%u"
+                      " EDR 2M=%u 3M=%u, 3-slot EDR=%u 5-slot EDR=%u\r\n",
+                      (unsigned long) now, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[0] & 1u,
+                      (f[0] >> 1) & 1u, (f[3] >> 1) & 1u, (f[3] >> 2) & 1u, (f[4] >> 7) & 1u, f[5] & 1u);
+        }
     }
     // Variant O: events are logged from boot, not only after the first
     // connection, so a Connection Request during the boot inquiry shows.
     // Command Complete / Status only for the commands that decide whether the
     // controller page-scans while it inquires (scan enable, page scan activity
     // and type, inquiry, inquiry cancel).
-    const uint32_t now = port::now_ms();
     if (code == 0x0E || code == 0x0F) {
         if (plen < 4) return;
         const uint16_t op = little_endian_read_16(prm, code == 0x0E ? 1 : 2);
@@ -335,7 +396,58 @@ int transport_send_packet(uint8_t packet_type, uint8_t *packet, int size) {
     } else {
         ++diag_cnt.bt_acl_out;
         diag_cnt.bt_acl_out_bytes += pkt.p.acl_data.len;
+        if (pkt.p.acl_data.len > diag_cnt.bt_acl_out_max) diag_cnt.bt_acl_out_max = pkt.p.acl_data.len;
         diag_note_bt_tx(packet_type, pkt.p.acl_data.conhdl);
+        const uint8_t pb = pkt.p.acl_data.pb_bc_flag & 0x03;
+        const uint16_t handle = pkt.p.acl_data.conhdl;
+        if (pb == 0x01) ++diag_cnt.bt_acl_out_cont;
+
+        // Variant P: a new audio alt-setting change re-arms the trace of the
+        // next outgoing audio reports.
+        const uint32_t alt_ms = diag_cnt.stream_alt_ms;
+        if (alt_ms != g_diag_alt_seen_ms) {
+            g_diag_alt_seen_ms = alt_ms;
+            g_diag_audio_acl_since_alt = 0;
+            if (diag_cnt.stream_alt[1] != 0 || diag_cnt.stream_alt[2] != 0) {
+                g_diag_audio_log_left = 16;
+                g_diag_nocp_log_left = 16;
+                diag_logf("[bt] t=%lu audio stream open (itf1 alt %u, itf2 alt %u): logging the next 16 outgoing audio"
+                          " ACL packets and completed-packet events; BTstack ACL packet length %u, free slots %ld\r\n",
+                          (unsigned long) port::now_ms(), (unsigned) diag_cnt.stream_alt[1],
+                          (unsigned) diag_cnt.stream_alt[2], (unsigned) hci_max_acl_data_packet_length(),
+                          (long) hci_number_free_acl_slots_for_handle(handle));
+            }
+        }
+        bool audio = false;
+        uint16_t l2len = 0, cid = 0;
+        uint8_t report = 0;
+        if (pb != 0x01 && size >= 10) {
+            l2len = little_endian_read_16(packet, 4);
+            cid = little_endian_read_16(packet, 6);
+            report = packet[9];
+            audio = packet[8] == 0xA2 && (report == 0x32 || report == 0x36 || report == 0x39);
+            g_diag_in_audio_report = audio;
+        } else if (pb == 0x01) {
+            audio = g_diag_in_audio_report;
+        } else {
+            g_diag_in_audio_report = false;
+        }
+        if (audio && pb != 0x01) ++g_diag_audio_acl_since_alt;
+        if (audio && g_diag_audio_log_left > 0) {
+            --g_diag_audio_log_left;
+            const uint32_t us = port::now_us32();
+            if (pb != 0x01) {
+                diag_logf("[bt] t=%lu.%03lu acl out: handle 0x%03X pb=%u len=%u | l2cap len=%u cid=0x%04X report 0x%02X"
+                          " | rc=%d | free slots after %ld | completed so far %lu events / %lu packets\r\n",
+                          (unsigned long) (us / 1000), (unsigned long) (us % 1000), handle, pb, pkt.p.acl_data.len,
+                          l2len, cid, report, rc, (long) hci_number_free_acl_slots_for_handle(handle),
+                          (unsigned long) diag_cnt.bt_nocp_events, (unsigned long) diag_cnt.bt_nocp_packets);
+            } else {
+                diag_logf("[bt] t=%lu.%03lu acl out: handle 0x%03X pb=1 (continuation) len=%u | rc=%d | free slots after %ld\r\n",
+                          (unsigned long) (us / 1000), (unsigned long) (us % 1000), handle, pkt.p.acl_data.len, rc,
+                          (long) hci_number_free_acl_slots_for_handle(handle));
+            }
+        }
     }
     if (rc != 0) ++diag_cnt.bt_send_fail;
 #endif

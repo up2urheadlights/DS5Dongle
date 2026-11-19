@@ -255,6 +255,10 @@ if(DS5_BL616_DIAG_LOG)
                          -Wl,--wrap=_Z16battery_led_tickv
                          -Wl,--wrap=_Z12button_checkv
                          -Wl,--wrap=_Z16bt_inquiring_ledv)
+    # Variant P: every caller that takes the USB device off the bus, logged
+    # with its return address (diag_probes.c).
+    sdk_add_link_options(-Wl,--wrap=tud_disconnect
+                         -Wl,--wrap=tud_connect)
 endif()
 
 sdk_set_main_file(main_bl616.c)

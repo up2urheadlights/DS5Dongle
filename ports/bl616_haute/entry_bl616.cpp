@@ -19,6 +19,8 @@ extern "C" {
 
 #if DS5_BL616_DIAG_LOG
 #include "diag_log.h"
+#include "port/port.h"
+#include "tusb.h"
 #endif
 
 extern int ds5_shared_main();
@@ -73,6 +75,36 @@ extern "C" void ds5_bl616_bt_ready(void) {
 }
 
 #if DS5_BL616_DIAG_LOG
+// Variant P: the audio pipeline's state in one line, for the monitor task's
+// [aud] lines (diag_log.c). Read only, from the monitor task, while the main
+// loop and the audio worker run: each value is a snapshot, not a consistent set.
+extern port::Queue audio_fifo, audio_spk_fifo, haptics_fifo, mic_fifo, mic_decode_fifo; // audio.cpp
+extern port::Queue send_fifo;                                                          // bt.cpp
+extern bool spk_active;                                                                // main.cpp
+bool audio_mic_active();                                                               // audio.cpp
+
+extern "C" void bl616_diag_audio_state(char *buf, uint32_t cap) {
+    static TaskHandle_t worker = nullptr, main_task = nullptr;
+    if (worker == nullptr) worker = xTaskGetHandle("audio_worker");
+    if (main_task == nullptr) main_task = xTaskGetHandle("ds5_main");
+    tu_fifo_t *out_ff = tud_audio_get_ep_out_ff();
+    tu_fifo_t *in_ff = tud_audio_get_ep_in_ff();
+    static const char *const states[] = {"running", "ready", "blocked", "suspended", "deleted", "invalid"};
+    const eTaskState ws = worker != nullptr ? eTaskGetState(worker) : eInvalid;
+    snprintf(buf, cap,
+             "spk_active=%d mic_active=%d | usb speaker fifo %u B, mic fifo %u B | queues pcm %u/2 opus %u/2"
+             " haptics %u/2 mic %u/8 mic_pcm %u/8 bt_send %u/10 | worker %s, stack never-used %lu B"
+             " | main stack never-used %lu B",
+             spk_active ? 1 : 0, audio_mic_active() ? 1 : 0,
+             out_ff != nullptr ? (unsigned) tu_fifo_count(out_ff) : 0u,
+             in_ff != nullptr ? (unsigned) tu_fifo_count(in_ff) : 0u, (unsigned) audio_fifo.level(),
+             (unsigned) audio_spk_fifo.level(), (unsigned) haptics_fifo.level(), (unsigned) mic_fifo.level(),
+             (unsigned) mic_decode_fifo.level(), (unsigned) send_fifo.level(),
+             worker != nullptr ? states[ws <= eDeleted ? ws : 5] : "not found",
+             worker != nullptr ? (unsigned long) uxTaskGetStackHighWaterMark(worker) * sizeof(StackType_t) : 0ul,
+             main_task != nullptr ? (unsigned long) uxTaskGetStackHighWaterMark(main_task) * sizeof(StackType_t) : 0ul);
+}
+
 // Debug build: the hooks write to the log that survives a reset (diag_log.c).
 // A malloc failure still returns NULL to the caller, as in production; a stack
 // overflow or an assert stops with interrupts masked until the watchdog (or,

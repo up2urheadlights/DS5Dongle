@@ -49,6 +49,17 @@
  * replaces those hex digits with '*' (the UART itself is not reachable on
  * this board). The HCI event log below prints only the code of Link Key
  * Request / Notification and Return Link Keys events.
+ *
+ * Variant P resets the chip on purpose in two cases, so the log around them
+ * can be read (the USB device, and with it the log report, is hidden once the
+ * pad's link drops): USB silent for 2 s after it was configured -- no device
+ * interrupt and no SOF frame-number change, or the firmware's own
+ * tud_disconnect() still in force 2 s later -- and a Bluetooth disconnection
+ * within 5 s of a speaker/mic SET_INTERFACE. A host suspend with no audio
+ * stream open is not counted as silence. Before the reset the USB state is
+ * dumped ([usbdump] lines); at the next boot the previous boot's last 16 KB
+ * are copied out of the ring, because the log can only be read again once a
+ * pad has reconnected, and the new boot keeps writing meanwhile.
  */
 #include "diag_log.h"
 
@@ -75,7 +86,7 @@ struct diag_counters diag_cnt;
 
 #define DIAG_RING_SIZE  65536U /* power of two */
 #define DIAG_RING_MASK  (DIAG_RING_SIZE - 1U)
-#define DIAG_MAGIC      0x44474C33U /* "DGL3": the crumb layout changed in variant O */
+#define DIAG_MAGIC      0x44474C34U /* "DGL4": the crumb layout changed in variant P */
 #define BOOT2_RAM_TOUCHED 0x62FE8800U /* see the file comment */
 
 struct diag_crumbs {
@@ -92,6 +103,11 @@ struct diag_crumbs {
     uint32_t reset_ms;
     uint32_t hwtimer_ms; /* last run of the timer interrupt (100 ms period) */
     uint32_t wdt_cnt;    /* watchdog counter at that run */
+    /* Variant P */
+    uint32_t bt_disc;       /* last HCI Disconnection Complete: reason | 0x100 (0 = none this boot) */
+    uint32_t bt_disc_ms;
+    uint32_t stream_alt;    /* last SET_INTERFACE on itf 1/2: itf << 8 | alt | 0x10000 (0 = none) */
+    uint32_t stream_alt_ms;
 };
 #define DIAG_CRUMB_WORDS (sizeof(struct diag_crumbs) / sizeof(uint32_t))
 
@@ -115,6 +131,23 @@ static struct diag_persist g_persist_storage __attribute__((section(".noinit_dat
 static volatile struct diag_persist *g_p;
 static bool g_inited;
 static uint32_t g_tail; /* next byte the host reads */
+
+/* Variant P: the previous boot's last bytes, copied out of the ring at boot.
+ * After a reset the log can only be read once a pad has reconnected (the
+ * DualSense interface, which carries the log report, is shown only then), and
+ * the new boot keeps writing into the same 64 KB ring meanwhile; without this
+ * copy, the lines written just before the reset -- the ones that say why --
+ * were overwritten after a few minutes. Ordinary RAM: it only has to live for
+ * this boot. The reader serves, in order: whatever is still intact of the
+ * previous boot before the copy (phase 0), the copy (phase 1), this boot
+ * (phase 2). */
+#define DIAG_PREV_COPY_SIZE 16384U
+static uint8_t g_prev_copy[DIAG_PREV_COPY_SIZE];
+static uint32_t g_prev_copy_len;
+static uint32_t g_prev_copy_pos;
+static uint32_t g_boot_head;     /* ring position where this boot's first line starts */
+static uint32_t g_prev_a_end;    /* end of phase 0: g_boot_head - g_prev_copy_len */
+static uint32_t g_read_phase;    /* 0, 1, 2 as above */
 
 static inline uint32_t now_ms(void)
 {
@@ -147,6 +180,8 @@ static const char *reset_reason_name(uint32_t r)
         case DIAG_RESET_ASSERT: return "FreeRTOS assert";
         case DIAG_RESET_STALL:  return "main loop stalled 3 s and the hardware watchdog had not reset (monitor task)";
         case DIAG_RESET_HWTIMER: return "monitor task stopped 3 s (timer interrupt)";
+        case DIAG_RESET_USB_SILENT: return "USB went silent for 2 s after it was configured (see the [usbdump] lines above)";
+        case DIAG_RESET_BT_DROP: return "Bluetooth link dropped within 5 s of an audio alt-setting change (see the lines above)";
         default:                return "unknown code";
     }
 }
@@ -165,6 +200,8 @@ static void diag_init_locked(void)
     GLB_Get_Reset_Reason(&rec);
 
     char line[768]; /* runs on the 4 KB startup stack (board_init's first printf) */
+    char line2[320];
+    int n2 = 0;
     const uint32_t magic_seen = p->magic;
     const bool valid = magic_seen == DIAG_MAGIC && p->magic_inv == ~DIAG_MAGIC &&
                        p->ring_size == DIAG_RING_SIZE && p->head_inv == ~p->head;
@@ -180,6 +217,15 @@ static void diag_init_locked(void)
                 fixed++;
             }
         }
+        /* Copy the previous boot's tail out of the ring (see g_prev_copy). */
+        g_prev_copy_len = held < DIAG_PREV_COPY_SIZE ? held : DIAG_PREV_COPY_SIZE;
+        for (uint32_t i = 0; i < g_prev_copy_len; i++) {
+            g_prev_copy[i] = p->ring[(head - g_prev_copy_len + i) & DIAG_RING_MASK];
+        }
+        g_boot_head = head;
+        g_prev_a_end = head - g_prev_copy_len;
+        g_tail = head - held;
+        g_read_phase = (g_tail == g_prev_a_end) ? 1U : 0U;
         struct diag_crumbs c;
         volatile uint32_t *src = (volatile uint32_t *)&p->crumbs;
         uint32_t *dst = (uint32_t *)&c;
@@ -208,8 +254,28 @@ static void diag_init_locked(void)
                      (unsigned long)(c.bt_last_rx >> 8), (unsigned long)(c.bt_last_rx & 0xFFU),
                      (unsigned long)(c.bt_last_tx >> 16), (unsigned long)(c.bt_last_tx & 0xFFFFU),
                      (unsigned long)fixed);
+        char bt_txt[64], st_txt[64];
+        if (c.bt_disc != 0U) {
+            snprintf(bt_txt, sizeof(bt_txt), "reason 0x%02lx at %lu ms", (unsigned long)(c.bt_disc & 0xFFU),
+                     (unsigned long)c.bt_disc_ms);
+        } else {
+            snprintf(bt_txt, sizeof(bt_txt), "none");
+        }
+        if (c.stream_alt != 0U) {
+            snprintf(st_txt, sizeof(st_txt), "itf %lu alt %lu at %lu ms", (unsigned long)((c.stream_alt >> 8) & 0xFFU),
+                     (unsigned long)(c.stream_alt & 0xFFU), (unsigned long)c.stream_alt_ms);
+        } else {
+            snprintf(st_txt, sizeof(st_txt), "none");
+        }
+        n2 = snprintf(line2, sizeof(line2),
+                      "=== previous boot #%lu, variant P crumbs: last Bluetooth disconnection %s; last audio SET_INTERFACE %s;"
+                      " its last %lu log bytes were also copied aside at this boot and are served before this line ===\r\n",
+                      (unsigned long)(boot - 1U), bt_txt, st_txt, (unsigned long)g_prev_copy_len);
     } else {
         boot = 1;
+        g_read_phase = 2U; /* nothing kept: read this boot from its start */
+        g_boot_head = 0;
+        g_tail = 0;
         p->magic = DIAG_MAGIC;
         p->magic_inv = ~DIAG_MAGIC;
         p->ring_size = DIAG_RING_SIZE;
@@ -230,6 +296,9 @@ static void diag_init_locked(void)
     }
     if (n > 0) {
         put_raw_locked((const uint8_t *)line, (uint32_t)n < sizeof(line) ? (uint32_t)n : sizeof(line) - 1U);
+    }
+    if (n2 > 0) {
+        put_raw_locked((const uint8_t *)line2, (uint32_t)n2 < sizeof(line2) ? (uint32_t)n2 : sizeof(line2) - 1U);
     }
     n = snprintf(line, sizeof(line), "=== boot #%lu, log ring %lu bytes at 0x%08lx%s ===\r\n",
                  (unsigned long)boot, (unsigned long)DIAG_RING_SIZE, (unsigned long)addr,
@@ -361,17 +430,54 @@ uint16_t diag_log_fill_report(uint8_t *buffer, uint16_t reqlen)
     ensure_init_locked();
     volatile struct diag_persist *p = g_p;
     uint32_t head = p->head;
-    if ((uint32_t)(head - g_tail) > DIAG_RING_SIZE) {
-        g_tail = head - DIAG_RING_SIZE; /* overrun (or first read): oldest held byte */
+    uint32_t n = 0;
+    if (g_read_phase == 0U) {
+        /* The previous boot, older than the copy, while the ring still holds it. */
+        if ((uint32_t)(head - g_tail) > DIAG_RING_SIZE) {
+            g_tail = head - DIAG_RING_SIZE;
+        }
+        if ((int32_t)(g_tail - g_prev_a_end) >= 0) {
+            g_read_phase = 1U;
+        } else {
+            n = g_prev_a_end - g_tail;
+            if (n > room) {
+                n = room;
+            }
+            for (uint32_t i = 0; i < n; i++) {
+                buffer[1 + i] = p->ring[(g_tail + i) & DIAG_RING_MASK];
+            }
+            g_tail += n;
+            if (g_tail == g_prev_a_end) {
+                g_read_phase = 1U;
+            }
+        }
     }
-    uint32_t n = head - g_tail;
-    if (n > room) {
-        n = room;
+    if (g_read_phase == 1U && n == 0U) {
+        /* The previous boot's last bytes, from the copy taken at boot. */
+        n = g_prev_copy_len - g_prev_copy_pos;
+        if (n > room) {
+            n = room;
+        }
+        memcpy(buffer + 1, &g_prev_copy[g_prev_copy_pos], n);
+        g_prev_copy_pos += n;
+        if (g_prev_copy_pos >= g_prev_copy_len) {
+            g_read_phase = 2U;
+            g_tail = g_boot_head;
+        }
     }
-    for (uint32_t i = 0; i < n; i++) {
-        buffer[1 + i] = p->ring[(g_tail + i) & DIAG_RING_MASK];
+    if (g_read_phase == 2U && n == 0U) {
+        if ((uint32_t)(head - g_tail) > DIAG_RING_SIZE) {
+            g_tail = head - DIAG_RING_SIZE; /* overrun: oldest held byte */
+        }
+        n = head - g_tail;
+        if (n > room) {
+            n = room;
+        }
+        for (uint32_t i = 0; i < n; i++) {
+            buffer[1 + i] = p->ring[(g_tail + i) & DIAG_RING_MASK];
+        }
+        g_tail += n;
     }
-    g_tail += n;
     bflb_irq_restore(flags);
 
     buffer[0] = (uint8_t)n;
@@ -466,7 +572,55 @@ void diag_note_usb_isr(int inside, const uint8_t *setup)
     }
 }
 
+void diag_note_bt_disconnect(uint8_t reason)
+{
+    volatile struct diag_persist *p = g_p;
+    if (p != NULL) {
+        p->crumbs.bt_disc = 0x100U | reason;
+        p->crumbs.bt_disc_ms = now_ms();
+    }
+}
+
+void diag_note_stream_alt(uint8_t itf, uint8_t alt)
+{
+    const uint32_t now = now_ms();
+    diag_cnt.stream_alt_ms = now != 0U ? now : 1U;
+    if (itf < 3U) {
+        diag_cnt.stream_alt[itf] = alt;
+    }
+    volatile struct diag_persist *p = g_p;
+    if (p != NULL) {
+        p->crumbs.stream_alt = 0x10000U | ((uint32_t)itf << 8) | alt;
+        p->crumbs.stream_alt_ms = now;
+    }
+}
+
 /* ------------------------------------------------------- fatal stops */
+
+/* Variant P: a reset the monitor task carries out (diag_request_reset). */
+static volatile uint32_t g_pending_reset_reason;
+static volatile uint32_t g_pending_reset_at_ms;
+static const char *volatile g_pending_reset_why;
+
+void diag_request_reset(uint32_t reason, uint32_t delay_ms, const char *why)
+{
+    const uint32_t now = now_ms();
+    uintptr_t flags = bflb_irq_save();
+    const bool first = g_pending_reset_reason == 0U;
+    if (first) {
+        g_pending_reset_reason = reason;
+        g_pending_reset_at_ms = now + delay_ms;
+        g_pending_reset_why = why;
+    }
+    bflb_irq_restore(flags);
+    if (first) {
+        diag_logf("[diag] t=%lu RESET REQUESTED (reason %lu) in %lu ms: %s\r\n", (unsigned long)now,
+                  (unsigned long)reason, (unsigned long)delay_ms, why != NULL ? why : "");
+    } else {
+        diag_logf("[diag] t=%lu reset request (reason %lu) ignored, one is already pending: %s\r\n",
+                  (unsigned long)now, (unsigned long)reason, why != NULL ? why : "");
+    }
+}
 
 static void record_reset_reason(uint32_t reason)
 {
@@ -794,7 +948,7 @@ static void print_wdt_lines(uint32_t now)
 
 /* ------------------------------------------------------------- monitor */
 
-#define DIAG_TASK_STACK_WORDS 1024U
+#define DIAG_TASK_STACK_WORDS 1536U /* variant P: the reset path dumps the USB state from this task */
 #define DIAG_TICK_MS          250U
 #define DIAG_COUNTER_MS       5000U
 #define DIAG_HEALTH_MS        30000U
@@ -834,6 +988,7 @@ struct usb_snapshot {
 static struct usb_snapshot g_usb_last;
 static struct {
     uint32_t acl_in, evt_in, acl_out, acl_out_bytes, cmd_out, send_fail, drops, evt_unlogged, passes;
+    uint32_t cont, nocp_e, nocp_p;
 } g_bt_last;
 
 static void print_bt_line(uint32_t now)
@@ -853,15 +1008,24 @@ static void print_bt_line(uint32_t now)
     } else {
         snprintf(slots, sizeof(slots), "%ld (min %ld)", (long)free_now, (long)free_min);
     }
-    diag_logf("[diag] t=%lu bt: acl_in=%lu evt_in=%lu acl_out=%lu (%lu B) cmd_out=%lu send_fail=%lu"
+    const uint32_t cont = diag_cnt.bt_acl_out_cont, nocp_e = diag_cnt.bt_nocp_events;
+    const uint32_t nocp_p = diag_cnt.bt_nocp_packets;
+    const uint32_t out_max = __atomic_exchange_n(&diag_cnt.bt_acl_out_max, 0U, __ATOMIC_SEQ_CST);
+    diag_logf("[diag] t=%lu bt: acl_in=%lu evt_in=%lu acl_out=%lu (%lu B, largest %lu B, %lu continuation fragments)"
+              " completed=%lu in %lu events cmd_out=%lu send_fail=%lu"
               " ring_peak=%lu/%lu drops=%lu evt_unlogged=%lu acl_free=%s | main: passes=%lu max_gap=%lu ms\r\n",
               (unsigned long)now, (unsigned long)(acl_in - g_bt_last.acl_in),
               (unsigned long)(evt_in - g_bt_last.evt_in), (unsigned long)(acl_out - g_bt_last.acl_out),
-              (unsigned long)(bytes - g_bt_last.acl_out_bytes), (unsigned long)(cmd_out - g_bt_last.cmd_out),
+              (unsigned long)(bytes - g_bt_last.acl_out_bytes), (unsigned long)out_max,
+              (unsigned long)(cont - g_bt_last.cont), (unsigned long)(nocp_p - g_bt_last.nocp_p),
+              (unsigned long)(nocp_e - g_bt_last.nocp_e), (unsigned long)(cmd_out - g_bt_last.cmd_out),
               (unsigned long)(fail - g_bt_last.send_fail), (unsigned long)peak,
               (unsigned long)diag_cnt.bt_ring_size, (unsigned long)(drops - g_bt_last.drops),
               (unsigned long)(unlogged - g_bt_last.evt_unlogged), slots,
               (unsigned long)(passes - g_bt_last.passes), (unsigned long)gap);
+    g_bt_last.cont = cont;
+    g_bt_last.nocp_e = nocp_e;
+    g_bt_last.nocp_p = nocp_p;
     g_bt_last.acl_in = acl_in;
     g_bt_last.evt_in = evt_in;
     g_bt_last.acl_out = acl_out;
@@ -956,6 +1120,75 @@ static void print_task_health(uint32_t now)
     }
 }
 
+/* Variant P: the reset the USB-silence and Bluetooth-drop checks ask for. The
+ * USB state is dumped first; everything goes to the ring that survives the
+ * reset, and the next boot copies the tail aside before it can be overwritten. */
+static void __attribute__((noreturn)) variant_p_reset(uint32_t reason, const char *why)
+{
+    diag_logf("[diag] t=%lu VARIANT P RESET (reason %lu, %s): %s\r\n", (unsigned long)now_ms(),
+              (unsigned long)reason, reset_reason_name(reason), why != NULL ? why : "");
+    bl616_dcd_diag_dump(why);
+    char aud[256];
+    bl616_diag_audio_state(aud, sizeof(aud));
+    diag_logf("[aud] t=%lu at the reset: %s\r\n", (unsigned long)now_ms(), aud);
+    char wdt[96];
+    wdt_state(wdt, sizeof(wdt));
+    diag_logf("[diag] t=%lu main loop at %s, %lu passes; %s; software reset now\r\n", (unsigned long)now_ms(),
+              diag_where_name(g_p != NULL ? g_p->crumbs.main_where : 0U),
+              (unsigned long)(g_p != NULL ? g_p->crumbs.main_passes : 0U), wdt);
+    record_reset_reason(reason);
+    GLB_SW_System_Reset();
+    while (1) {
+    }
+}
+
+/* Variant P: the audio pipeline, every second for 5 s after an alt-setting
+ * change on the speaker or mic interface, then every 5 s while either is open. */
+static struct {
+    uint32_t ep1_done, ep1_armed, ep2_done, ep2_armed, short_n, zero_n;
+} g_aud_last;
+static uint32_t g_aud_next_ms;
+
+static void print_audio_line(uint32_t now)
+{
+    const uint32_t alt_ms = diag_cnt.stream_alt_ms;
+    const bool open = diag_cnt.stream_alt[1] != 0U || diag_cnt.stream_alt[2] != 0U;
+    const bool recent = alt_ms != 0U && (uint32_t)(now - alt_ms) < 5000U;
+    if (!open && !recent) {
+        return;
+    }
+    if ((int32_t)(now - g_aud_next_ms) < 0) {
+        return;
+    }
+    g_aud_next_ms = now + (recent ? 1000U : 5000U);
+    const uint32_t d1 = diag_cnt.usb_done_out[1], a1 = diag_cnt.usb_armed_out[1];
+    const uint32_t d2 = diag_cnt.usb_done_in[2], a2 = diag_cnt.usb_armed_in[2];
+    const uint32_t sh = diag_cnt.usb_iso_out_short, zr = diag_cnt.usb_iso_out_zero;
+    const uint32_t lmin = __atomic_exchange_n(&diag_cnt.usb_iso_out_min, 0xFFFFFFFFU, __ATOMIC_SEQ_CST);
+    const uint32_t lmax = __atomic_exchange_n(&diag_cnt.usb_iso_out_max, 0U, __ATOMIC_SEQ_CST);
+    char lens[40];
+    if (lmin == 0xFFFFFFFFU) {
+        snprintf(lens, sizeof(lens), "no completions");
+    } else {
+        snprintf(lens, sizeof(lens), "len %lu..%lu", (unsigned long)lmin, (unsigned long)lmax);
+    }
+    char aud[256];
+    bl616_diag_audio_state(aud, sizeof(aud));
+    diag_logf("[aud] t=%lu itf1(speaker) alt %u, itf2(mic) alt %u, last change %lu ms ago | ep1 out done/armed +%lu/+%lu"
+              " short=+%lu zero-length=+%lu %s | ep2 in done/armed +%lu/+%lu | %s\r\n",
+              (unsigned long)now, (unsigned)diag_cnt.stream_alt[1], (unsigned)diag_cnt.stream_alt[2],
+              (unsigned long)(alt_ms != 0U ? now - alt_ms : 0U), (unsigned long)(d1 - g_aud_last.ep1_done),
+              (unsigned long)(a1 - g_aud_last.ep1_armed), (unsigned long)(sh - g_aud_last.short_n),
+              (unsigned long)(zr - g_aud_last.zero_n), lens, (unsigned long)(d2 - g_aud_last.ep2_done),
+              (unsigned long)(a2 - g_aud_last.ep2_armed), aud);
+    g_aud_last.ep1_done = d1;
+    g_aud_last.ep1_armed = a1;
+    g_aud_last.ep2_done = d2;
+    g_aud_last.ep2_armed = a2;
+    g_aud_last.short_n = sh;
+    g_aud_last.zero_n = zr;
+}
+
 static void diag_task(void *arg)
 {
     (void)arg;
@@ -1005,6 +1238,20 @@ static void diag_task(void *arg)
             }
         }
 
+        /* Variant P: a reset asked for by the Bluetooth-drop check, once its
+         * delay has passed; then the USB-silence check. */
+        if (g_pending_reset_reason != 0U && (int32_t)(now - g_pending_reset_at_ms) >= 0) {
+            variant_p_reset(g_pending_reset_reason, g_pending_reset_why);
+        }
+        {
+            static char why[240];
+            const uint32_t r = bl616_dcd_diag_check_silence(now, why, sizeof(why));
+            if (r != 0U) {
+                variant_p_reset(r, why);
+            }
+        }
+        print_audio_line(now);
+
         if ((int32_t)(now - next_counters) >= 0) {
             next_counters += DIAG_COUNTER_MS;
             diag_logf("[diag] heartbeat uptime_ms=%lu heap_free=%u logged=%lu\r\n", (unsigned long)now,
@@ -1024,6 +1271,7 @@ void diag_log_start_heartbeat(unsigned long priority)
 {
     diag_cnt.bt_acl_free_now = -1;
     diag_cnt.bt_acl_free_min = -1;
+    diag_cnt.usb_iso_out_min = 0xFFFFFFFFU;
     timers_init();
     if (xTaskCreateStatic(diag_task, "diag_mon", DIAG_TASK_STACK_WORDS, NULL, (UBaseType_t)priority,
                           diag_task_stack, &diag_task_tcb) == NULL) {

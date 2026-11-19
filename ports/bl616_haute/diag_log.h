@@ -42,6 +42,17 @@ void diag_fatal(uint32_t reason, const char *fmt, ...) __attribute__((format(pri
 #define DIAG_RESET_FALLBACK      4u /* diag_fatal: the watchdog did not fire */
 #define DIAG_RESET_STALL         5u /* monitor task: main loop stalled 3 s, the watchdog had not reset */
 #define DIAG_RESET_HWTIMER       6u /* timer interrupt: the monitor task itself stopped for 3 s */
+#define DIAG_RESET_USB_SILENT    7u /* variant P: configured, then the host went silent for 2 s */
+#define DIAG_RESET_BT_DROP       8u /* variant P: Bluetooth link dropped within 5 s of an audio alt-setting change */
+
+/* Variant P: asks the monitor task to reset the chip once delay_ms has passed
+ * (so the lines that follow the cause still reach the ring), after a full USB
+ * state dump. The first request wins; later ones are logged and ignored. Safe
+ * from tasks and interrupts. */
+void diag_request_reset(uint32_t reason, uint32_t delay_ms, const char *why);
+/* Variant P: crumbs for the previous-boot line. */
+void diag_note_bt_disconnect(uint8_t reason);
+void diag_note_stream_alt(uint8_t itf, uint8_t alt);
 
 /* --------------------------------------------------- main-loop position */
 
@@ -105,6 +116,19 @@ struct diag_counters {
     volatile uint32_t usb_done_out[5];
     volatile uint16_t usb_set_report[256]; /* control SET_REPORT, by report ID */
     volatile uint16_t usb_out_report[256]; /* interrupt OUT (EP 0x03), by first byte */
+    /* Variant P: Bluetooth fragmentation and completed-packet accounting */
+    volatile uint32_t bt_acl_out_cont;    /* outgoing ACL packets with pb=0x01 (continuation fragments) */
+    volatile uint32_t bt_acl_out_max;     /* largest outgoing ACL payload since the last report */
+    volatile uint32_t bt_nocp_events;     /* Number Of Completed Packets events */
+    volatile uint32_t bt_nocp_packets;    /* packets they returned, summed */
+    /* Variant P: audio streams (SET_INTERFACE on the speaker itf 1 / mic itf 2) */
+    volatile uint32_t stream_alt_ms;      /* time of the last alt-setting change on itf 1 or 2, 0 = none */
+    volatile uint8_t stream_alt[3];       /* current alt per interface number 1, 2 */
+    volatile uint32_t usb_iso_out_short;  /* EP1 completions shorter than the transfer armed */
+    volatile uint32_t usb_iso_out_zero;   /* EP1 zero-length packets (RX0BYTE) */
+    volatile uint32_t usb_iso_out_min;    /* shortest / longest EP1 completion since the last audio line */
+    volatile uint32_t usb_iso_out_max;
+    volatile uint32_t usb_disc_caller;    /* return address of the latest tud_disconnect()/tud_connect() caller */
 };
 extern struct diag_counters diag_cnt;
 
@@ -118,6 +142,16 @@ void bl616_dcd_diag_status(uint32_t *isg0, uint32_t *isg2, uint32_t *isg3, int *
 /* dcd_bl616.c: bounded waits that timed out, and SETUPs that found a control
  * VDMA still armed, both since boot. */
 void bl616_dcd_diag_waits(uint32_t *timeouts, uint32_t *cx_preempted);
+/* dcd_bl616.c, variant P: called by the monitor every 250 ms. Returns 0 while
+ * the host is talking, else a DIAG_RESET_* reason to reset for, with the
+ * explanation in why. */
+uint32_t bl616_dcd_diag_check_silence(uint32_t now_ms, char *why, uint32_t cap);
+/* dcd_bl616.c, variant P: every DCD endpoint state, the controller's FIFO,
+ * VDMA and interrupt registers, and the last USB events, as log lines. */
+void bl616_dcd_diag_dump(const char *why);
+/* entry_bl616.cpp, variant P: one line of audio pipeline state (queue levels,
+ * TinyUSB's speaker FIFO, the worker's state and stack). */
+void bl616_diag_audio_state(char *buf, uint32_t cap);
 
 /* The watchdog's counter (diag_log.c), read by the loop-top wrapper before it
  * feeds the watchdog (diag_probes.c). */

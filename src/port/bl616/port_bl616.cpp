@@ -17,12 +17,16 @@ extern "C" {
 #include "bflb_core.h"
 #include "bflb_flash.h"
 #include "bflb_gpio.h"
+#include "bflb_mtimer.h"
 #include "bflb_wdg.h"
 #include "bl616_glb.h"
 #include "bl616_glb_gpio.h"
 #include "FreeRTOS.h"
 #include "task.h"
 #include "timers.h"
+#if DS5_BL616_DIAG_LOG
+#include "diag_log.h"
+#endif
 }
 
 namespace port {
@@ -158,13 +162,57 @@ bool pin_is_led_out(uint32_t pin) {
 }
 } // namespace
 
+// The button's polarity is decided from the pin's idle level, once.
+//
+// GPIO2 is the BL616 boot strap: the chip enters its ROM download mode when the
+// pin is HIGH at reset, so this application only ever runs after a reset that
+// saw GPIO2 low, i.e. with the button released. A board whose button connects
+// GPIO2 to 3V3 (active high) therefore needs an external pull-down, which our
+// internal pull-up cannot overcome: with the old fixed "active low, pull-up"
+// reading, such a board reads "pressed" from the first sample, the shared code
+// fires the hold gesture (clear all pairings) 1.5 s after the loop starts, and
+// a real press then reads as a release. So: sample the pin with the pull-up
+// first. High = nothing pulls it down = the active-low wiring the port assumed
+// (unchanged behaviour). Low = an external pull-down = active-high wiring:
+// switch to the internal pull-down and treat high as pressed.
+namespace {
+bool g_button_active_high = false;
+#if DS5_BL616_DIAG_LOG
+int g_button_last_level = -1;
+#endif
+} // namespace
+
 bool boot_button_pressed() {
     static bool configured = false;
     if (!configured) {
         bflb_gpio_init(gpio_dev(), BOARD_BUTTON_GPIO, GPIO_INPUT | GPIO_PULLUP | GPIO_SMT_EN);
+        bflb_mtimer_delay_us(100); // let the pull-up settle the pin
+        const bool idle_high = bflb_gpio_read(gpio_dev(), BOARD_BUTTON_GPIO);
+        g_button_active_high = !idle_high;
+        if (g_button_active_high) {
+            bflb_gpio_init(gpio_dev(), BOARD_BUTTON_GPIO, GPIO_INPUT | GPIO_PULLDOWN | GPIO_SMT_EN);
+        }
+        printf("[Port] button GPIO%u idle level with pull-up: %s -> reading it as active %s%s\n",
+               static_cast<unsigned>(BOARD_BUTTON_GPIO), idle_high ? "high" : "LOW",
+               g_button_active_high ? "high" : "low",
+               g_button_active_high ? " (external pull-down; internal pull-down now)" : " (pull-up kept)");
+#if DS5_BL616_DIAG_LOG
+        diag_logf("[btn] t=%lu GPIO%u idle with pull-up=%d -> active %s\r\n",
+                  static_cast<unsigned long>(bflb_mtimer_get_time_ms()), static_cast<unsigned>(BOARD_BUTTON_GPIO),
+                  idle_high ? 1 : 0, g_button_active_high ? "high" : "low");
+#endif
         configured = true;
     }
-    return !bflb_gpio_read(gpio_dev(), BOARD_BUTTON_GPIO); // active low
+    const bool level = bflb_gpio_read(gpio_dev(), BOARD_BUTTON_GPIO);
+#if DS5_BL616_DIAG_LOG
+    if ((level ? 1 : 0) != g_button_last_level) {
+        diag_logf("[btn] t=%lu GPIO%u raw level %d (%s)\r\n", static_cast<unsigned long>(bflb_mtimer_get_time_ms()),
+                  static_cast<unsigned>(BOARD_BUTTON_GPIO), level ? 1 : 0,
+                  level == g_button_active_high ? "pressed" : "released");
+        g_button_last_level = level ? 1 : 0;
+    }
+#endif
+    return level == g_button_active_high;
 }
 
 void worker_flash_safe_init() {
@@ -188,12 +236,19 @@ struct bflb_device_s *g_wdg = nullptr;
 bool watchdog_caused_reboot() {
     GLB_RESET_RECORD_Type rec{};
     GLB_Get_Reset_Reason(&rec);
+    const uint32_t raw = getreg32(GLB_BASE + GLB_RESET_STS0_OFFSET);
+    // The record is sticky: nothing but this clears it, so without the clear a
+    // single watchdog reset would read as one at every boot until power-off.
+    GLB_Clr_Reset_Reason();
+    const uint32_t after = getreg32(GLB_BASE + GLB_RESET_STS0_OFFSET);
     // Printed raw so the bit's meaning can be checked against a known reset;
     // the SDK documents the field only by name.
-    printf("[Port] reset record: por=%u ext=%u pds=%u wdt=%u cpu_por=%u sys=%u cpu_sys=%u\n",
+    printf("[Port] reset record: por=%u ext=%u pds=%u wdt=%u cpu_por=%u sys=%u cpu_sys=%u "
+           "(raw 0x%08lx; after clearing 0x%08lx)\n",
            rec.reset_recorder_ana_powb, rec.reset_recorder_ext_rst_n, rec.reset_recorder_pds_reset,
            rec.reset_recorder_wdt_rst_n, rec.reset_recorder_cpu_porst_n,
-           rec.reset_recorder_sys_reset_n, rec.reset_recorder_cpu_sys_rstreq_n);
+           rec.reset_recorder_sys_reset_n, rec.reset_recorder_cpu_sys_rstreq_n,
+           static_cast<unsigned long>(raw), static_cast<unsigned long>(after));
     return rec.reset_recorder_wdt_rst_n != 0;
 }
 

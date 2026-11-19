@@ -40,6 +40,8 @@ void diag_fatal(uint32_t reason, const char *fmt, ...) __attribute__((format(pri
 #define DIAG_RESET_STACK         2u /* FreeRTOS stack overflow hook */
 #define DIAG_RESET_ASSERT        3u /* configASSERT */
 #define DIAG_RESET_FALLBACK      4u /* diag_fatal: the watchdog did not fire */
+#define DIAG_RESET_STALL         5u /* monitor task: main loop stalled 3 s, the watchdog had not reset */
+#define DIAG_RESET_HWTIMER       6u /* timer interrupt: the monitor task itself stopped for 3 s */
 
 /* --------------------------------------------------- main-loop position */
 
@@ -88,6 +90,10 @@ struct diag_counters {
     volatile uint32_t bt_evt_unlogged;  /* events the event log skipped (rate limit) */
     /* Main loop */
     volatile uint32_t main_max_gap_ms;  /* longest time between two passes since the last report */
+    /* Hardware watchdog, read at the loop top just before each feed */
+    volatile uint32_t wdt_feeds;        /* feeds (port::watchdog_update calls) */
+    volatile uint32_t wdt_cnt_max;      /* highest counter value seen before a feed since the last report */
+    volatile uint32_t wdt_cnt_last;     /* counter value before the latest feed */
     /* USB device controller */
     volatile uint32_t usb_setup;
     volatile uint32_t usb_bus_reset;
@@ -109,6 +115,13 @@ void diag_note_usb_isr(int inside, const uint8_t *setup); /* entry/exit with NUL
 
 /* dcd_bl616.c: the controller's error/status bits, read only, for the 5 s line. */
 void bl616_dcd_diag_status(uint32_t *isg0, uint32_t *isg2, uint32_t *isg3, int *started, int *connected);
+/* dcd_bl616.c: bounded waits that timed out, and SETUPs that found a control
+ * VDMA still armed, both since boot. */
+void bl616_dcd_diag_waits(uint32_t *timeouts, uint32_t *cx_preempted);
+
+/* The watchdog's counter (diag_log.c), read by the loop-top wrapper before it
+ * feeds the watchdog (diag_probes.c). */
+uint32_t diag_wdt_counter(void);
 
 #ifdef __cplusplus
 }

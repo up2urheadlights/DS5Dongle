@@ -60,8 +60,11 @@
 
 #include "bflb_irq.h"
 #include "bflb_mtimer.h"
+#include "bflb_timer.h"
 #include "bflb_uart.h"
 #include "bl616_glb.h"
+#include "bl616_hbn.h"
+#include "hardware/timer_reg.h"
 #include "FreeRTOS.h"
 #include "mm.h"
 #include "task.h"
@@ -72,7 +75,7 @@ struct diag_counters diag_cnt;
 
 #define DIAG_RING_SIZE  65536U /* power of two */
 #define DIAG_RING_MASK  (DIAG_RING_SIZE - 1U)
-#define DIAG_MAGIC      0x44474C32U /* "DGL2" */
+#define DIAG_MAGIC      0x44474C33U /* "DGL3": the crumb layout changed in variant O */
 #define BOOT2_RAM_TOUCHED 0x62FE8800U /* see the file comment */
 
 struct diag_crumbs {
@@ -87,6 +90,8 @@ struct diag_crumbs {
     uint32_t bt_last_tx; /* H4 type << 16 | opcode (command) or handle (ACL) */
     uint32_t reset_reason;
     uint32_t reset_ms;
+    uint32_t hwtimer_ms; /* last run of the timer interrupt (100 ms period) */
+    uint32_t wdt_cnt;    /* watchdog counter at that run */
 };
 #define DIAG_CRUMB_WORDS (sizeof(struct diag_crumbs) / sizeof(uint32_t))
 
@@ -140,6 +145,8 @@ static const char *reset_reason_name(uint32_t r)
         case DIAG_RESET_FAULT:  return "CPU exception (see the FAULT line above)";
         case DIAG_RESET_STACK:  return "FreeRTOS stack overflow";
         case DIAG_RESET_ASSERT: return "FreeRTOS assert";
+        case DIAG_RESET_STALL:  return "main loop stalled 3 s and the hardware watchdog had not reset (monitor task)";
+        case DIAG_RESET_HWTIMER: return "monitor task stopped 3 s (timer interrupt)";
         default:                return "unknown code";
     }
 }
@@ -182,7 +189,8 @@ static void diag_init_locked(void)
         boot = p->boot_count + 1U;
         n = snprintf(line, sizeof(line),
                      "\r\n=== previous boot ended here; reset record: por=%u ext=%u pds=%u wdt=%u cpu_por=%u sys=%u cpu_sys=%u;"
-                     " previous boot #%lu: main loop last at %s (0x%02lx) in pass %lu at %lu ms, monitor last ran at %lu ms;"
+                     " previous boot #%lu: main loop last at %s (0x%02lx) in pass %lu at %lu ms, monitor last ran at %lu ms,"
+                     " timer interrupt last ran at %lu ms (watchdog counter %lu then);"
                      " software reset: %s%s at %lu ms; usb isr %s (%lu interrupts, last setup %08lx %08lx);"
                      " last bt rx type %lu code 0x%02lx; last bt tx type %lu op/handle 0x%04lx;"
                      " %lu unreadable byte(s) shown as '?' ===\r\n",
@@ -191,6 +199,7 @@ static void diag_init_locked(void)
                      rec.reset_recorder_sys_reset_n, rec.reset_recorder_cpu_sys_rstreq_n,
                      (unsigned long)(boot - 1U), diag_where_name(c.main_where), (unsigned long)c.main_where,
                      (unsigned long)c.main_passes, (unsigned long)c.main_last_ms, (unsigned long)c.monitor_ms,
+                     (unsigned long)c.hwtimer_ms, (unsigned long)c.wdt_cnt,
                      reset_reason_name(c.reset_reason),
                      (c.reset_reason & 0x100U) ? ", then a software reset because the watchdog did not fire" : "",
                      (unsigned long)c.reset_ms,
@@ -207,7 +216,7 @@ static void diag_init_locked(void)
         p->head = 0;
         p->head_inv = ~0U;
         n = snprintf(line, sizeof(line),
-                     "\r\n=== no previous log in RAM (power-on, or the RAM was not kept: header magic %08lx);"
+                     "\r\n=== no previous log in RAM (power-on, the RAM was not kept, or an older log layout: header magic %08lx);"
                      " reset record: por=%u ext=%u pds=%u wdt=%u cpu_por=%u sys=%u cpu_sys=%u ===\r\n",
                      (unsigned long)magic_seen,
                      rec.reset_recorder_ana_powb, rec.reset_recorder_ext_rst_n, rec.reset_recorder_pds_reset,
@@ -603,6 +612,186 @@ void __wrap_exception_entry(uintptr_t *regs)
     }
 }
 
+/* ------------------------------------------------------------ watchdog */
+
+/* The watchdog's registers (the SDK's "watchdog0", inside the timer block),
+ * found by diag_log_start_heartbeat(). 0 = not found: then nothing below can
+ * look, and the lines say so rather than print zeros. */
+static uintptr_t g_wdt_base;
+
+uint32_t diag_wdt_counter(void)
+{
+    return g_wdt_base != 0U ? (uint32_t)getreg16(g_wdt_base + TIMER_WVR_OFFSET) : 0U;
+}
+
+/* "cnt=C of M, enabled=E reset_mode=R": what the hardware holds right now. */
+static void wdt_state(char *buf, size_t cap)
+{
+    if (g_wdt_base == 0U) {
+        snprintf(buf, cap, "watchdog registers not found (could not look)");
+        return;
+    }
+    const uint32_t wmer = getreg32(g_wdt_base + TIMER_WMER_OFFSET);
+    snprintf(buf, cap, "watchdog cnt=%lu of match %lu, enabled=%lu reset_mode=%lu",
+             (unsigned long)getreg16(g_wdt_base + TIMER_WVR_OFFSET),
+             (unsigned long)(getreg32(g_wdt_base + TIMER_WMR_OFFSET) & TIMER_WMR_MASK),
+             (unsigned long)((wmer & TIMER_WE) ? 1U : 0U), (unsigned long)((wmer & TIMER_WRIE) ? 1U : 0U));
+}
+
+/* Last resort, independent of the watchdog: the stall it should have cured is
+ * logged with the watchdog's own state, recorded, and the chip reset. */
+static void __attribute__((noreturn)) stall_reset(uint32_t reason, const char *who, uint32_t age_ms)
+{
+    char wdt[96];
+    wdt_state(wdt, sizeof(wdt));
+    diag_logf("[diag] t=%lu %s: no progress for %lu ms (main loop at %s); %s; software reset now\r\n",
+              (unsigned long)now_ms(), who, (unsigned long)age_ms,
+              diag_where_name(g_p != NULL ? g_p->crumbs.main_where : 0U), wdt);
+    record_reset_reason(reason);
+    GLB_SW_System_Reset();
+    while (1) {
+    }
+}
+
+/* ----------------------------------------------------- timer interrupt */
+
+/* Timer 0, every 100 ms, at the highest interrupt level. It catches the one
+ * stop the monitor task cannot report: the scheduler itself no longer running
+ * the monitor (scheduler suspended, a task spinning above it) while interrupts
+ * are still taken. It cannot catch a stop with interrupts masked or inside an
+ * interrupt handler: on this port every trap runs with MIE clear and handlers
+ * do not nest (no CONFIG_HIGH_ISR_STACK), and FreeRTOS critical sections clear
+ * MIE, so no interrupt of any level is taken then. That case is the hardware
+ * watchdog's alone; the crumb hwtimer_ms tells it apart afterwards (it stops
+ * advancing when interrupts stop). */
+#define DIAG_HWTIMER_PERIOD_US 100000U
+#define DIAG_STALL_RESET_MS    3000U
+
+static struct bflb_device_s *g_hwtimer;
+static struct bflb_device_s *g_probe_1k;
+
+static void hwtimer_isr(int irq, void *arg)
+{
+    (void)irq;
+    (void)arg;
+    if (bflb_timer_get_compint_status(g_hwtimer, TIMER_COMP_ID_0)) {
+        bflb_timer_compint_clear(g_hwtimer, TIMER_COMP_ID_0);
+    }
+    volatile struct diag_persist *p = g_p;
+    if (p == NULL) {
+        return;
+    }
+    const uint32_t now = now_ms();
+    p->crumbs.hwtimer_ms = now;
+    p->crumbs.wdt_cnt = diag_wdt_counter();
+    const uint32_t mon = p->crumbs.monitor_ms;
+    if (mon != 0U && (uint32_t)(now - mon) >= DIAG_STALL_RESET_MS) {
+        stall_reset(DIAG_RESET_HWTIMER, "HWTIMER: the monitor task has stopped", now - mon);
+    }
+}
+
+static void timers_init(void)
+{
+    struct bflb_device_s *wdt = bflb_device_get_by_name(BFLB_NAME_WDT);
+    g_wdt_base = wdt != NULL ? wdt->reg_base : 0U;
+
+    /* Timer 1: free-running on the 1 kHz source the watchdog uses
+     * (WDG_CLKSRC_1K and TIMER_CLKSRC_1K are the same selector value in the
+     * same clock-source register). The 5 s line prints how far it counted:
+     * about 5000 means that source runs. */
+    g_probe_1k = bflb_device_get_by_name(BFLB_NAME_TIMER1);
+    if (g_probe_1k != NULL) {
+        struct bflb_timer_config_s c = {
+            .counter_mode = TIMER_COUNTER_MODE_UP,
+            .clock_source = TIMER_CLKSRC_1K,
+            .clock_div = 0,
+            .trigger_comp_id = TIMER_COMP_NONE,
+            .comp0_val = 0xFFFFFFFFU,
+            .comp1_val = 0xFFFFFFFFU,
+            .comp2_val = 0xFFFFFFFFU,
+            .preload_val = 0,
+        };
+        bflb_timer_init(g_probe_1k, &c);
+        bflb_timer_start(g_probe_1k);
+    }
+
+    /* Timer 0: XTAL 40 MHz / 40 = 1 MHz, match every 100 ms, reload. */
+    g_hwtimer = bflb_device_get_by_name(BFLB_NAME_TIMER0);
+    if (g_hwtimer != NULL) {
+        struct bflb_timer_config_s c = {
+            .counter_mode = TIMER_COUNTER_MODE_PROLOAD,
+            .clock_source = TIMER_CLKSRC_XTAL,
+            .clock_div = 39,
+            .trigger_comp_id = TIMER_COMP_ID_0,
+            .comp0_val = DIAG_HWTIMER_PERIOD_US,
+            .comp1_val = 0xFFFFFFFFU,
+            .comp2_val = 0xFFFFFFFFU,
+            .preload_val = 0,
+        };
+        bflb_timer_init(g_hwtimer, &c);
+        bflb_irq_attach(g_hwtimer->irq_num, hwtimer_isr, NULL);
+        const uint8_t bits = (uint8_t)((CLIC->CLICINFO & CLIC_INFO_CLICINTCTLBITS_Msk) >> CLIC_INFO_CLICINTCTLBITS_Pos);
+        bflb_irq_set_priority(g_hwtimer->irq_num, (uint8_t)((1U << bits) - 1U), 0);
+        bflb_irq_enable(g_hwtimer->irq_num);
+        bflb_timer_start(g_hwtimer);
+    }
+    diag_logf("[diag] timers: watchdog regs %s, 1 kHz probe on timer1 %s, stall interrupt on timer0 %s\r\n",
+              g_wdt_base != 0U ? "found" : "NOT FOUND", g_probe_1k != NULL ? "started" : "NOT FOUND",
+              g_hwtimer != NULL ? "started (100 ms, top level)" : "NOT FOUND");
+}
+
+static uint32_t g_probe_last_cnt, g_probe_last_ms;
+static uint32_t g_wdt_last_feeds;
+
+static void print_wdt_lines(uint32_t now)
+{
+    const uint32_t feeds = diag_cnt.wdt_feeds;
+    const uint32_t cmax = __atomic_exchange_n(&diag_cnt.wdt_cnt_max, 0U, __ATOMIC_SEQ_CST);
+    char state[96];
+    wdt_state(state, sizeof(state));
+    uint32_t probe = 0, probe_ms = 0;
+    if (g_probe_1k != NULL) {
+        const uint32_t c = bflb_timer_get_countervalue(g_probe_1k);
+        probe = c - g_probe_last_cnt;
+        probe_ms = now - g_probe_last_ms;
+        g_probe_last_cnt = c;
+    }
+    g_probe_last_ms = now;
+    if (g_wdt_base == 0U) {
+        diag_logf("[diag] t=%lu wdt: feeds=%lu; %s\r\n", (unsigned long)now,
+                  (unsigned long)(feeds - g_wdt_last_feeds), state);
+    } else {
+        diag_logf("[diag] t=%lu wdt: feeds=%lu cnt_before_feed max=%lu last=%lu | %s | wmer=0x%08lx wmr=0x%08lx"
+                  " tccr=0x%08lx (cs_wdt=%lu) tcdr=0x%08lx (wcdr=%lu) wsr=0x%08lx\r\n",
+                  (unsigned long)now, (unsigned long)(feeds - g_wdt_last_feeds), (unsigned long)cmax,
+                  (unsigned long)diag_cnt.wdt_cnt_last, state,
+                  (unsigned long)getreg32(g_wdt_base + TIMER_WMER_OFFSET),
+                  (unsigned long)getreg32(g_wdt_base + TIMER_WMR_OFFSET),
+                  (unsigned long)getreg32(g_wdt_base + TIMER_TCCR_OFFSET),
+                  (unsigned long)((getreg32(g_wdt_base + TIMER_TCCR_OFFSET) & TIMER_CS_WDT_MASK) >> TIMER_CS_WDT_SHIFT),
+                  (unsigned long)getreg32(g_wdt_base + TIMER_TCDR_OFFSET),
+                  (unsigned long)((getreg32(g_wdt_base + TIMER_TCDR_OFFSET) & TIMER_WCDR_MASK) >> TIMER_WCDR_SHIFT),
+                  (unsigned long)getreg32(g_wdt_base + TIMER_WSR_OFFSET));
+    }
+    g_wdt_last_feeds = feeds;
+    const uint32_t cgen1 = getreg32(GLB_BASE + GLB_CGEN_CFG1_OFFSET);
+    const uint32_t hbn_glb = getreg32(HBN_BASE + HBN_GLB_OFFSET);
+    uint32_t timeouts = 0, preempted = 0;
+    bl616_dcd_diag_waits(&timeouts, &preempted);
+    char probe_txt[64];
+    if (g_probe_1k != NULL) {
+        snprintf(probe_txt, sizeof(probe_txt), "+%lu counts in %lu ms", (unsigned long)probe, (unsigned long)probe_ms);
+    } else {
+        snprintf(probe_txt, sizeof(probe_txt), "not running (could not look)");
+    }
+    diag_logf("[diag] t=%lu clk: cgen1=0x%08lx (timer/wdt clock gate bit21=%lu) hbn_glb=0x%08lx (f32k_sel=%lu pu_rc32k=%lu)"
+              " | 1 kHz probe %s | timer irq last %lu ms ago | usb: wait timeouts=%lu setup_preempted_vdma=%lu\r\n",
+              (unsigned long)now, (unsigned long)cgen1, (unsigned long)((cgen1 >> 21) & 1U), (unsigned long)hbn_glb,
+              (unsigned long)((hbn_glb >> 3) & 3U), (unsigned long)((hbn_glb >> 5) & 1U), probe_txt,
+              (unsigned long)(g_p != NULL ? now - g_p->crumbs.hwtimer_ms : 0U),
+              (unsigned long)timeouts, (unsigned long)preempted);
+}
+
 /* ------------------------------------------------------------- monitor */
 
 #define DIAG_TASK_STACK_WORDS 1024U
@@ -797,6 +986,12 @@ static void diag_task(void *arg)
             last_passes = passes;
         } else if (passes != 0U) {
             const uint32_t age = now - g_p->crumbs.main_last_ms;
+            if (age >= DIAG_STALL_RESET_MS) {
+                /* The 1 s hardware watchdog should have reset the chip two
+                 * seconds ago. */
+                stall_reset(DIAG_RESET_STALL, "watchdog: main loop stalled and the hardware watchdog did not reset",
+                            age);
+            }
             if (age >= DIAG_STALL_MS && (!stall_reported || age >= next_stall_report)) {
                 const uint32_t where = g_p->crumbs.main_where;
                 diag_logf("[diag] t=%lu watchdog: main loop stalled %lu ms at %s (0x%02lx); ds5_main %s,"
@@ -816,6 +1011,7 @@ static void diag_task(void *arg)
                       (unsigned int)kfree_size(0), (unsigned long)(g_p != NULL ? g_p->head : 0U));
             print_bt_line(now);
             print_usb_lines(now);
+            print_wdt_lines(now);
         }
         if ((int32_t)(now - next_health) >= 0) {
             next_health += DIAG_HEALTH_MS;
@@ -828,6 +1024,7 @@ void diag_log_start_heartbeat(unsigned long priority)
 {
     diag_cnt.bt_acl_free_now = -1;
     diag_cnt.bt_acl_free_min = -1;
+    timers_init();
     if (xTaskCreateStatic(diag_task, "diag_mon", DIAG_TASK_STACK_WORDS, NULL, (UBaseType_t)priority,
                           diag_task_stack, &diag_task_tcb) == NULL) {
         diag_logf("[diag] monitor task create FAILED\r\n");

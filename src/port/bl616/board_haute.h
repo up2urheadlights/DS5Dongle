@@ -5,9 +5,12 @@
 // Measured on the hardware, not taken from a schematic (none is published):
 //  - Status LED: one LED, active low. The firmware drives both GPIO27 and
 //    GPIO28 because one of the two lights it; driving the other is harmless.
-//  - Side button: GPIO2, active low. Holding it while plugging in enters the
-//    BL616 ROM USB bootloader (VID 349B PID 6160), so the button is also the
-//    boot strap and can be read freely once the application runs.
+//  - Side button: GPIO2. Holding it while plugging in enters the BL616 ROM USB
+//    bootloader (VID 349B PID 6160), so the button is also the boot strap and
+//    can be read freely once the application runs. Its polarity was first
+//    assumed active low; every boot then read it as held (pairings cleared at
+//    ~5.4 s with nobody touching it), so port_bl616.cpp now decides the
+//    polarity from the pin's idle level at the first read.
 //  - QFN40 leads out only GPIO 0-3, 10-17, 20-22 and 27-30. GPIO32/33 (the
 //    bl616dk USB pin setup) do not exist on this package, and the SDK's pad
 //    check traps (ebreak, then spins) on any pin that is not led out, so this

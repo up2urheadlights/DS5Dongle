@@ -156,15 +156,31 @@ void diag_on_rx(const uint8_t *h4, uint32_t len) {
     } else if (code == 0x05 && plen >= 3) { // Disconnection Complete
         if ((little_endian_read_16(prm, 1) & 0x0FFF) == g_diag_handle) g_diag_handle = 0xFFFF;
     }
-    if (!g_diag_connected_once) return;
-    if (code == 0x0E || code == 0x0F || code == 0x13) return;
-
+    // Variant O: events are logged from boot, not only after the first
+    // connection, so a Connection Request during the boot inquiry shows.
+    // Command Complete / Status only for the commands that decide whether the
+    // controller page-scans while it inquires (scan enable, page scan activity
+    // and type, inquiry, inquiry cancel).
     const uint32_t now = port::now_ms();
+    if (code == 0x0E || code == 0x0F) {
+        if (plen < 4) return;
+        const uint16_t op = little_endian_read_16(prm, code == 0x0E ? 1 : 2);
+        const uint8_t status = code == 0x0E ? prm[3] : prm[0];
+        if (op == 0x0C1A || op == 0x0C1C || op == 0x0C47 || op == 0x0401 || op == 0x0402) {
+            diag_logf("[hci] t=%lu %s op 0x%04X status 0x%02X\r\n", (unsigned long) now,
+                      code == 0x0E ? "cmd complete" : "cmd status", op, status);
+        }
+        return;
+    }
+    if (code == 0x13) return;
+
+    // Connection Request / Complete and Disconnection are never rate limited.
+    const bool always = code == 0x03 || code == 0x04 || code == 0x05;
     if (now - g_diag_evt_window_ms >= 5000) {
         g_diag_evt_window_ms = now;
         g_diag_evt_lines = 0;
     }
-    if (g_diag_evt_lines >= kDiagEvtLinesPer5s) {
+    if (!always && g_diag_evt_lines >= kDiagEvtLinesPer5s) {
         ++diag_cnt.bt_evt_unlogged;
         return;
     }
@@ -308,6 +324,14 @@ int transport_send_packet(uint8_t packet_type, uint8_t *packet, int size) {
     if (packet_type == HCI_COMMAND_DATA_PACKET) {
         ++diag_cnt.bt_cmd_out;
         diag_note_bt_tx(packet_type, pkt.p.hci_cmd.opcode);
+        if (pkt.p.hci_cmd.opcode == 0x0C1A && size >= 4) { // Write_Scan_Enable: 1 inquiry, 2 page scan
+            diag_logf("[hci] t=%lu sent Write_Scan_Enable 0x%02X (page scan %s, inquiry scan %s), rc=%d\r\n",
+                      (unsigned long) port::now_ms(), packet[3], (packet[3] & 2) ? "on" : "off",
+                      (packet[3] & 1) ? "on" : "off", rc);
+        } else if (pkt.p.hci_cmd.opcode == 0x0401 || pkt.p.hci_cmd.opcode == 0x0402) {
+            diag_logf("[hci] t=%lu sent %s, rc=%d\r\n", (unsigned long) port::now_ms(),
+                      pkt.p.hci_cmd.opcode == 0x0401 ? "Inquiry" : "Inquiry_Cancel", rc);
+        }
     } else {
         ++diag_cnt.bt_acl_out;
         diag_cnt.bt_acl_out_bytes += pkt.p.acl_data.len;

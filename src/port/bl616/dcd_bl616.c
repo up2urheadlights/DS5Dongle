@@ -109,7 +109,45 @@ static volatile bool g_want_connected;
 static volatile bool g_int_enabled;
 static volatile bool g_remote_wakeup_pending;
 
+/* Every wait on the controller is bounded (wait_reg_clear below). A wait that
+ * times out is counted here, in production too, and in the debug build logged
+ * with the register it was polling. */
+static volatile uint32_t g_wait_timeouts;
+/* A SETUP arrived while a control VDMA was still armed (the host abandoned a
+ * control transfer); that VDMA was stopped before the SETUP was read. */
+static volatile uint32_t g_cx_vdma_preempted;
+#if DS5_BL616_DIAG_LOG
+static volatile bool g_speed_after_reset_pending;
+#endif
+
+/* The SETUP packet is already in the control FIFO when its interrupt fires, so
+ * the 8-byte VDMA read completes in microseconds; 1 ms is far beyond that. */
+#define DCD_SETUP_READ_TIMEOUT_US 1000u
+/* The controller's soft reset, at start-up only. */
+#define DCD_SOFT_RESET_TIMEOUT_US 10000u
+
 /* ---------------------------------------------------------------- helpers */
+
+/* Polls until every bit of mask is clear at addr, for at most timeout_us.
+ * Returns true if the bits cleared; false on timeout, counted, and in the debug
+ * build logged as "[usb] t=T TIMEOUT waiting for <what> (reg=0x...)". Safe in
+ * the interrupt: the machine timer is read directly. */
+static bool wait_reg_clear(uint32_t addr, uint32_t mask, uint32_t timeout_us, const char *what)
+{
+    uint64_t const t0 = bflb_mtimer_get_time_us();
+    uint32_t regval;
+    while ((regval = getreg32(addr)) & mask) {
+        if (bflb_mtimer_get_time_us() - t0 >= timeout_us) {
+            g_wait_timeouts++;
+            DIAG(diag_logf("[usb] t=%lu TIMEOUT waiting for %s (reg=0x%08lx), %lu timeout(s) so far\r\n",
+                           (unsigned long)bflb_mtimer_get_time_ms(), what, (unsigned long)regval,
+                           (unsigned long)g_wait_timeouts));
+            (void)what;
+            return false;
+        }
+    }
+    return true;
+}
 
 /* TinyUSB's endpoint buffers are placed in .noncacheable (bl616_tusb_mem.h).
  * Anything else that reaches the VDMA through the cached RAM alias
@@ -313,6 +351,13 @@ static tusb_speed_t port_speed(void)
     return TUSB_SPEED_HIGH;
 }
 
+#if DS5_BL616_DIAG_LOG
+static const char *speed_name(tusb_speed_t s)
+{
+    return s == TUSB_SPEED_HIGH ? "high" : (s == TUSB_SPEED_FULL ? "full" : "low");
+}
+#endif
+
 static void reset_all_fifos(void)
 {
     reset_fifo(USB_FIFO_F0);
@@ -423,7 +468,11 @@ static void controller_init(void)
     regval = getreg32(BFLB_USB_BASE + USB_DEV_CTL_OFFSET);
     regval |= USB_SFRST_HOV;
     putreg32(regval, BFLB_USB_BASE + USB_DEV_CTL_OFFSET);
-    while (getreg32(BFLB_USB_BASE + USB_DEV_CTL_OFFSET) & USB_SFRST_HOV) {
+    if (!wait_reg_clear(BFLB_USB_BASE + USB_DEV_CTL_OFFSET, USB_SFRST_HOV, DCD_SOFT_RESET_TIMEOUT_US,
+                        "the controller soft reset (DEV_CTL SFRST)")) {
+        /* Carry on: the configuration below is still written, and a controller
+         * that never leaves reset simply does not enumerate. */
+        printf("[USB] controller soft reset did not complete in %u us\r\n", (unsigned)DCD_SOFT_RESET_TIMEOUT_US);
     }
 
     regval = getreg32(BFLB_USB_BASE + USB_DEV_ADR_OFFSET);
@@ -825,6 +874,18 @@ static void diag_usb_setup(const uint8_t *s)
     const uint16_t index = (uint16_t)(s[4] | (s[5] << 8));
     diag_cnt.usb_setup++;
     diag_note_usb_isr(1, s);
+    if (g_speed_after_reset_pending) {
+        /* The bus reset interrupt may come before the high-speed chirp has
+         * finished; by the first SETUP the speed is settled. TinyUSB keeps the
+         * speed it was given at the reset. */
+        g_speed_after_reset_pending = false;
+        uint32_t const csr = getreg32(BFLB_USB_BASE + USB_OTG_CSR_OFFSET);
+        uint32_t const ctl = getreg32(BFLB_USB_BASE + USB_DEV_CTL_OFFSET);
+        diag_logf("[usb] t=%lu first SETUP after the reset: speed now %s (otg_csr=0x%08lx spd_typ=%lu, dev_ctl=0x%08lx hs_en=%lu)\r\n",
+                  (unsigned long)t, speed_name(port_speed()), (unsigned long)csr,
+                  (unsigned long)((csr & USB_SPD_TYP_HOV_POV_MASK) >> USB_SPD_TYP_HOV_POV_SHIFT),
+                  (unsigned long)ctl, (unsigned long)((ctl & USB_HS_EN_HOV) ? 1u : 0u));
+    }
     if (type == 0x00 && req == 0x05) {
         diag_logf("[usb] t=%lu SET_ADDRESS %u\r\n", (unsigned long)t, value);
     } else if (type == 0x00 && req == 0x09) {
@@ -850,6 +911,14 @@ void bl616_dcd_diag_status(uint32_t *isg0, uint32_t *isg2, uint32_t *isg3, int *
     *isg2 = getreg32(BFLB_USB_BASE + USB_DEV_ISG2_OFFSET) & (USB_ISO_SEQ_ERR_INT | USB_ISO_SEQ_ABORT_INT | USB_DMA_ERROR_HOV);
     *isg3 = getreg32(BFLB_USB_BASE + USB_DEV_ISG3_OFFSET) &
             (USB_VDMA_ERROR_CXF | USB_VDMA_ERROR_F0 | USB_VDMA_ERROR_F1 | USB_VDMA_ERROR_F2 | USB_VDMA_ERROR_F3);
+}
+
+/* Totals since boot: bounded waits that timed out, and SETUPs that found a
+ * control VDMA still armed. */
+void bl616_dcd_diag_waits(uint32_t *timeouts, uint32_t *cx_preempted)
+{
+    *timeouts = g_wait_timeouts;
+    *cx_preempted = g_cx_vdma_preempted;
 }
 #endif
 
@@ -879,15 +948,36 @@ void dcd_int_handler(uint8_t rhport)
     if (dev_intstatus & USB_INT_G0) {
         status = group_intstatus(0);
         if (status & USB_CX_SETUP_INT) {
-            /* A new SETUP supersedes whatever EP0 was doing. */
+            /* A new SETUP supersedes whatever EP0 was doing. A data-stage
+             * VDMA the host abandoned may still be armed on the control
+             * channel: stop it before the channel is reprogrammed for the
+             * SETUP read, rather than rewriting a running channel. */
             ep_in[0].active = false;
             ep_out[0].active = false;
-            vdma_start(USB_FIFO_CXF, setup_buf, 8, false);
-            while (getreg32(BFLB_USB_BASE + USB_VDMA_CXFPS1_OFFSET) & USB_VDMA_START_CXF) {
+            if (getreg32(BFLB_USB_BASE + USB_VDMA_CXFPS1_OFFSET) & USB_VDMA_START_CXF) {
+                g_cx_vdma_preempted++;
+                vdma_stop(USB_FIFO_CXF);
+                DIAG(diag_logf("[usb] t=%lu SETUP while a control VDMA was armed (cxfps1=0x%08lx); stopped it, %lu so far\r\n",
+                               (unsigned long)bflb_mtimer_get_time_ms(),
+                               (unsigned long)getreg32(BFLB_USB_BASE + USB_VDMA_CXFPS1_OFFSET),
+                               (unsigned long)g_cx_vdma_preempted));
             }
-            group_int_clear(3, USB_VDMA_CMPLT_CXF);
-            DIAG(diag_usb_setup(setup_buf));
-            dcd_event_setup_received(0, setup_buf, true);
+            vdma_start(USB_FIFO_CXF, setup_buf, 8, false);
+            if (wait_reg_clear(BFLB_USB_BASE + USB_VDMA_CXFPS1_OFFSET, USB_VDMA_START_CXF,
+                               DCD_SETUP_READ_TIMEOUT_US, "the SETUP read (VDMA_CXFPS1 START)")) {
+                group_int_clear(3, USB_VDMA_CMPLT_CXF);
+                DIAG(diag_usb_setup(setup_buf));
+                dcd_event_setup_received(0, setup_buf, true);
+            } else {
+                /* The SETUP was not read. Stop the VDMA, empty the control
+                 * FIFO and stall EP0: the host retries the request, which
+                 * TinyUSB then sees as a fresh SETUP. */
+                vdma_stop(USB_FIFO_CXF);
+                reset_fifo(USB_FIFO_CXF);
+                group_int_clear(3, USB_VDMA_CMPLT_CXF);
+                uint32_t const cx = getreg32(BFLB_USB_BASE + USB_DEV_CXCFE_OFFSET);
+                putreg32(cx | USB_CX_STL, BFLB_USB_BASE + USB_DEV_CXCFE_OFFSET);
+            }
         }
     }
 
@@ -945,10 +1035,16 @@ void dcd_int_handler(uint8_t rhport)
             putreg32(regval, BFLB_USB_BASE + USB_DEV_SMT_OFFSET);
 
             ep0_reset_state();
-            DIAG(diag_cnt.usb_bus_reset++;
-                 diag_logf("[usb] t=%lu bus reset, %s speed\r\n", (unsigned long)bflb_mtimer_get_time_ms(),
-                           port_speed() == TUSB_SPEED_HIGH ? "high" : (port_speed() == TUSB_SPEED_FULL ? "full" : "low")));
-            dcd_event_bus_reset(0, port_speed(), true);
+            tusb_speed_t const speed = port_speed();
+            DIAG(diag_cnt.usb_bus_reset++; g_speed_after_reset_pending = true;
+                 diag_logf("[usb] t=%lu bus reset, %s speed told to TinyUSB (otg_csr=0x%08lx spd_typ=%lu, dev_ctl=0x%08lx hs_en=%lu force_fs=%lu)\r\n",
+                           (unsigned long)bflb_mtimer_get_time_ms(), speed_name(speed),
+                           (unsigned long)getreg32(BFLB_USB_BASE + USB_OTG_CSR_OFFSET),
+                           (unsigned long)((getreg32(BFLB_USB_BASE + USB_OTG_CSR_OFFSET) & USB_SPD_TYP_HOV_POV_MASK) >> USB_SPD_TYP_HOV_POV_SHIFT),
+                           (unsigned long)getreg32(BFLB_USB_BASE + USB_DEV_CTL_OFFSET),
+                           (unsigned long)((getreg32(BFLB_USB_BASE + USB_DEV_CTL_OFFSET) & USB_HS_EN_HOV) ? 1u : 0u),
+                           (unsigned long)((getreg32(BFLB_USB_BASE + USB_DEV_CTL_OFFSET) & USB_FORCE_FS) ? 1u : 0u)));
+            dcd_event_bus_reset(0, speed, true);
         }
     }
 

@@ -7,7 +7,8 @@
  * "in X" before the call and "returned from X" after it in the crumb that
  * survives a reset (diag_log.c), so both the stall monitor and the next boot
  * can say where the loop stopped. port::watchdog_update(), the first call of
- * every pass, also counts the pass and the time between passes.
+ * every pass, also counts the pass and the time between passes, and reads the
+ * watchdog counter just before it is fed.
  *
  * The symbols are the C++ names the shared code links against (checked with
  * nm on main.cpp.obj). interrupt_loop() is defined in main.cpp itself and so
@@ -36,6 +37,15 @@ void __wrap__ZN4port15watchdog_updateEv(void);
 void __wrap__ZN4port15watchdog_updateEv(void)
 {
     diag_main_pass();
+    /* The watchdog counter just before this feed: with the loop passing every
+     * few ms it should read a few counts (1 kHz clock). Always 0 means the
+     * counter is not running, so the watchdog could never fire. */
+    const uint32_t cnt = diag_wdt_counter();
+    diag_cnt.wdt_cnt_last = cnt;
+    if (cnt > diag_cnt.wdt_cnt_max) {
+        diag_cnt.wdt_cnt_max = cnt;
+    }
+    diag_cnt.wdt_feeds++;
     diag_set_where(DIAG_WHERE_LOOP_TOP);
     __real__ZN4port15watchdog_updateEv();
     diag_set_where(DIAG_WHERE_LOOP_TOP | DIAG_WHERE_RETURNED);

@@ -72,6 +72,29 @@ extern "C" void ds5_bl616_bt_ready(void) {
     bl616_dcd_start();
 }
 
+#if DS5_BL616_DIAG_LOG
+// Debug build: the hooks write to the log that survives a reset (diag_log.c).
+// A malloc failure still returns NULL to the caller, as in production; a stack
+// overflow or an assert stops with interrupts masked until the watchdog (or,
+// before the main loop has armed it, a software reset) restarts the chip.
+extern "C" void vApplicationMallocFailedHook(void) {
+    printf("[BL616] malloc failed\r\n");
+    TaskHandle_t t = xTaskGetCurrentTaskHandle();
+    diag_logf("[diag] malloc failed in task %s\r\n",
+              xTaskGetSchedulerState() == taskSCHEDULER_NOT_STARTED || t == nullptr ? "(none)" : pcTaskGetName(t));
+}
+
+extern "C" void vApplicationStackOverflowHook(TaskHandle_t, char *name) {
+    diag_fatal(DIAG_RESET_STACK, "stack overflow in task %s\r\n", name);
+}
+
+// Replaces the SDK's weak vAssertCalled (abort()). configASSERT has already
+// printed the file, function, line and expression (FreeRTOSConfig.h); those
+// lines reach the log through the console copy.
+extern "C" void vAssertCalled(void) {
+    diag_fatal(DIAG_RESET_ASSERT, "FreeRTOS assert (location in the lines above)\r\n");
+}
+#else
 extern "C" void vApplicationMallocFailedHook(void) {
     printf("[BL616] malloc failed\r\n");
 }
@@ -81,6 +104,7 @@ extern "C" void vApplicationStackOverflowHook(TaskHandle_t, char *name) {
     while (true) {
     }
 }
+#endif
 
 extern "C" int ds5_bl616_entry(void) {
     board_init();
@@ -88,7 +112,10 @@ extern "C" int ds5_bl616_entry(void) {
     run_constructors();
 
 #if DS5_BL616_DIAG_LOG
-    diag_log_start_heartbeat(configMAX_PRIORITIES - 2);
+    // The monitor (heartbeat, counters, main-loop stall check) runs at the
+    // Bluetooth controller's priority so it time-slices with it rather than
+    // starving if that task spins.
+    diag_log_start_heartbeat(configMAX_PRIORITIES - 1);
 #endif
 
     // RF calibration, before the scheduler and before the controller starts,

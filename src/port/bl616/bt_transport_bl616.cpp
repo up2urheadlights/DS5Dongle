@@ -54,6 +54,10 @@ extern "C" {
 #include "task.h"
 }
 
+#if DS5_BL616_DIAG_LOG
+#include "diag_log.h" // ports/bl616_haute: counters, crumbs and the HCI event log
+#endif
+
 // Hook from entry_bl616.cpp: start the USB controller once Bluetooth is up (USB
 // is started only after Bluetooth init on this chip).
 extern "C" void ds5_bl616_bt_ready(void);
@@ -95,6 +99,9 @@ void ring_push(const uint8_t *h4, uint32_t len) {
         // Counted, not printed: this is the controller's task, and blocking it
         // on the console is how links get dropped. Reported from the poll.
         ++g_rx_dropped;
+#if DS5_BL616_DIAG_LOG
+        ++diag_cnt.bt_rx_drops;
+#endif
         if (len >= 2 && h4[0] == HCI_EVENT_PACKET) {
             g_rx_dropped_event_code[g_rx_dropped_events % kDroppedEventCodes] = h4[1];
             ++g_rx_dropped_events;
@@ -105,8 +112,78 @@ void ring_push(const uint8_t *h4, uint32_t len) {
     little_endian_store_16(len_tag, 0, static_cast<uint16_t>(len));
     btstack_ring_buffer_write(&g_ring, len_tag, sizeof(len_tag));
     btstack_ring_buffer_write(&g_ring, const_cast<uint8_t *>(h4), len);
+#if DS5_BL616_DIAG_LOG
+    {
+        const uint32_t used = btstack_ring_buffer_bytes_available(&g_ring);
+        if (used > diag_cnt.bt_ring_peak) diag_cnt.bt_ring_peak = used;
+    }
+#endif
     bflb_irq_restore(flags);
 }
+
+#if DS5_BL616_DIAG_LOG
+// Debug build: what the main task hands BTstack, counted, and every HCI event
+// after the first connection logged with up to 8 parameter bytes -- except
+// Command Complete, Command Status and Number Of Completed Packets (too many,
+// and counted anyway), and the code alone for the events that carry a link
+// key (0x15 Return Link Keys, 0x18 Link Key Notification) or ask for one
+// (0x17 Link Key Request). Ring-only lines (diag_logf), so this costs the main
+// loop microseconds, not the console's milliseconds.
+bool g_diag_connected_once = false;
+uint16_t g_diag_handle = 0xFFFF; // the ACL link whose free slots are reported
+uint32_t g_diag_evt_window_ms = 0;
+uint32_t g_diag_evt_lines = 0;
+constexpr uint32_t kDiagEvtLinesPer5s = 40;
+
+void diag_on_rx(const uint8_t *h4, uint32_t len) {
+    const uint8_t type = h4[0];
+    if (type == HCI_ACL_DATA_PACKET) {
+        ++diag_cnt.bt_acl_in;
+        diag_note_bt_rx(type, 0);
+        return;
+    }
+    if (type != HCI_EVENT_PACKET || len < 3) return;
+    const uint8_t code = h4[1];
+    uint32_t plen = h4[2];
+    if (plen > len - 3) plen = len - 3;
+    const uint8_t *prm = &h4[3];
+    ++diag_cnt.bt_evt_in;
+    diag_note_bt_rx(type, code);
+
+    if (code == 0x03 && plen >= 3) { // Connection Complete: status, handle
+        g_diag_connected_once = true;
+        if (prm[0] == 0) g_diag_handle = little_endian_read_16(prm, 1) & 0x0FFF;
+    } else if (code == 0x05 && plen >= 3) { // Disconnection Complete
+        if ((little_endian_read_16(prm, 1) & 0x0FFF) == g_diag_handle) g_diag_handle = 0xFFFF;
+    }
+    if (!g_diag_connected_once) return;
+    if (code == 0x0E || code == 0x0F || code == 0x13) return;
+
+    const uint32_t now = port::now_ms();
+    if (now - g_diag_evt_window_ms >= 5000) {
+        g_diag_evt_window_ms = now;
+        g_diag_evt_lines = 0;
+    }
+    if (g_diag_evt_lines >= kDiagEvtLinesPer5s) {
+        ++diag_cnt.bt_evt_unlogged;
+        return;
+    }
+    ++g_diag_evt_lines;
+    if (code == 0x15 || code == 0x17 || code == 0x18) {
+        diag_logf("[hci] t=%lu evt 0x%02X len=%lu (link key event: payload not logged)\r\n",
+                  (unsigned long) now, code, (unsigned long) plen);
+        return;
+    }
+    char hex[8 * 3 + 1];
+    hex[0] = '\0';
+    const uint32_t shown = plen < 8 ? plen : 8;
+    for (uint32_t i = 0; i < shown; i++) {
+        snprintf(&hex[i * 3], 4, " %02X", prm[i]);
+    }
+    diag_logf("[hci] t=%lu evt 0x%02X len=%lu:%s%s\r\n", (unsigned long) now, code, (unsigned long) plen,
+              hex, plen > 8 ? " ..." : "");
+}
+#endif
 
 // Controller -> host. Runs on the controller task.
 void onchip_rx_cb(uint8_t pkt_type, uint16_t src_id, uint8_t *param, uint8_t param_len) {
@@ -178,6 +255,9 @@ void transport_init(const void *) {}
 
 int transport_open() {
     btstack_ring_buffer_init(&g_ring, g_ring_storage, sizeof(g_ring_storage));
+#if DS5_BL616_DIAG_LOG
+    diag_cnt.bt_ring_size = sizeof(g_ring_storage);
+#endif
     if (!g_controller_started) {
         // Same priority Bouffalo's own bring-up gives it (configMAX_PRIORITIES
         // - 1), so the controller preempts everything else on the one core.
@@ -224,6 +304,17 @@ int transport_send_packet(uint8_t packet_type, uint8_t *packet, int size) {
         printf("[BT] unsupported outgoing HCI packet type %u\n", packet_type);
         return -1;
     }
+#if DS5_BL616_DIAG_LOG
+    if (packet_type == HCI_COMMAND_DATA_PACKET) {
+        ++diag_cnt.bt_cmd_out;
+        diag_note_bt_tx(packet_type, pkt.p.hci_cmd.opcode);
+    } else {
+        ++diag_cnt.bt_acl_out;
+        diag_cnt.bt_acl_out_bytes += pkt.p.acl_data.len;
+        diag_note_bt_tx(packet_type, pkt.p.acl_data.conhdl);
+    }
+    if (rc != 0) ++diag_cnt.bt_send_fail;
+#endif
     if (rc != 0) {
         printf("[BT] bt_onchiphci_send(type %u) failed: %d\n", packet_type, rc);
     }
@@ -378,10 +469,20 @@ void bt_transport_poll() {
 
         if (g_packet_handler != nullptr && len >= 1) {
             if (g_rx[0] == HCI_ACL_DATA_PACKET) ++g_rx_acl_count;
+#if DS5_BL616_DIAG_LOG
+            diag_on_rx(g_rx, len);
+            diag_set_where(DIAG_WHERE_BT_DISPATCH);
+#endif
             g_packet_handler(g_rx[0], &g_rx[1], static_cast<uint16_t>(len - 1));
+#if DS5_BL616_DIAG_LOG
+            diag_set_where(DIAG_WHERE_BT_POLL);
+#endif
         }
     }
 
+#if DS5_BL616_DIAG_LOG
+    diag_set_where(DIAG_WHERE_BT_DCD_POLL);
+#endif
     bl616_dcd_poll();
 
 #if DS5_BL616_DIAG_LOG
@@ -429,8 +530,24 @@ void bt_transport_poll() {
     }
 
     emit_packet_sent_if_pending();
+#if DS5_BL616_DIAG_LOG
+    diag_set_where(DIAG_WHERE_BT_RUN_LOOP);
+#endif
     btstack_run_loop_embedded_execute_once();
 
+#if DS5_BL616_DIAG_LOG
+    // BTstack's free outgoing ACL slots for the pad's link (it counts a packet
+    // as in flight until the controller's Number Of Completed Packets).
+    if (g_diag_handle != 0xFFFF) {
+        const int32_t free_slots = hci_number_free_acl_slots_for_handle(g_diag_handle);
+        diag_cnt.bt_acl_free_now = free_slots;
+        const int32_t low = diag_cnt.bt_acl_free_min;
+        if (low < 0 || free_slots < low) diag_cnt.bt_acl_free_min = free_slots;
+    } else {
+        diag_cnt.bt_acl_free_now = -1;
+    }
+    diag_set_where(DIAG_WHERE_BT_YIELD);
+#endif
     // The main loop never blocks; give equal-priority tasks (the audio worker)
     // the core once per pass. Higher-priority tasks preempt regardless.
     taskYIELD();

@@ -231,12 +231,30 @@ set_source_files_properties(${BTSTACK_SOURCES} ${TINYUSB_SOURCES} PROPERTIES
     COMPILE_OPTIONS "-Wno-maybe-uninitialized;-Wno-unused-variable;-Wno-unused-function")
 
 if(DS5_BL616_DIAG_LOG)
-    target_sources(app PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/diag_log.c")
+    target_sources(app PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/diag_log.c"
+                               "${CMAKE_CURRENT_SOURCE_DIR}/diag_probes.c")
     # Every console byte is copied into the log ring by wrapping the SDK's
     # UART output calls (diag_log.c), so nothing else needs to change.
     sdk_add_link_options(-Wl,--wrap=bflb_uart_putchar
                          -Wl,--wrap=bflb_uart_put
                          -Wl,--wrap=bflb_uart_put_block)
+    # CPU exceptions are written into the persistent log, then reset
+    # (diag_log.c), instead of the SDK's console core dump.
+    sdk_add_link_options(-Wl,--wrap=exception_entry)
+    # Main-loop position markers (diag_probes.c): every call the shared main
+    # loop makes, wrapped where main.cpp links to it. The C++ names are the
+    # ones main.cpp.obj references.
+    sdk_add_link_options(-Wl,--wrap=_ZN4port15watchdog_updateEv
+                         -Wl,--wrap=_ZN4port17bt_transport_pollEv
+                         -Wl,--wrap=_Z7bt_taskv
+                         -Wl,--wrap=_Z18usb_reconnect_taskv
+                         -Wl,--wrap=tud_task_ext
+                         -Wl,--wrap=_Z9wake_taskv
+                         -Wl,--wrap=_Z20button_shortcut_taskv
+                         -Wl,--wrap=_Z10audio_loopv
+                         -Wl,--wrap=_Z16battery_led_tickv
+                         -Wl,--wrap=_Z12button_checkv
+                         -Wl,--wrap=_Z16bt_inquiring_ledv)
 endif()
 
 sdk_set_main_file(main_bl616.c)

@@ -16,7 +16,7 @@ Stage 2 of the port:
 | Bond store | BTstack two-bank TLV in its own flash region (`board_haute.h`) |
 | USB to the PC | TinyUSB with this port's controller driver (`src/port/bl616/dcd_bl616.c`, adapted from the Bouffalo SDK's Apache-2.0 driver) |
 | Wake keyboard | Collections inside the DualSense HID interface (`src/port/bl616/usb_hid_bl616.cpp`), see below |
-| Debug log | Debug build only (`-DebugLog`): the console, read over USB as HID feature report `0x4F` |
+| Debug log | Debug build only (`-DebugLog`): the console, read over USB as HID feature report `0x4F`; kept in RAM across a watchdog or software reset, with fault capture, a main-loop stall check and 5 s counters (`diag_log.c`) |
 | Audio | Speaker and microphone, as on the other targets |
 
 CI builds the production image. The debug build presents the same device plus

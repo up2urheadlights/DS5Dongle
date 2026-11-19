@@ -49,6 +49,16 @@
 #error "dcd_bl616.c is for the BL616"
 #endif
 
+#if DS5_BL616_DIAG_LOG
+/* Debug build: transfer counters, bus events and the SETUP requests that change
+ * the device's state, written to the log ring from the interrupt
+ * (ports/bl616_haute/diag_log.c, ring-only lines, safe here). */
+#include "diag_log.h"
+#define DIAG(stmt) do { stmt; } while (0)
+#else
+#define DIAG(stmt) do { } while (0)
+#endif
+
 #define BFLB_USB_BASE           ((uint32_t)0x20072000)
 #define BFLB_PDS_BASE           ((uint32_t)0x2000E000)
 #define BFLB_USB_IRQ_NUM        37
@@ -376,7 +386,9 @@ static void usb_isr(int irq, void *arg)
 {
     (void)irq;
     (void)arg;
+    DIAG(diag_note_usb_isr(1, NULL));
     dcd_int_handler(0);
+    DIAG(diag_note_usb_isr(0, NULL));
 }
 
 static void controller_init(void)
@@ -703,6 +715,7 @@ bool dcd_edpt_xfer(uint8_t rhport, uint8_t ep_addr, uint8_t *buffer, uint16_t to
     if (!g_started || ep_idx >= EP_COUNT) {
         return false;
     }
+    DIAG(if (in) { diag_cnt.usb_armed_in[ep_idx]++; } else { diag_cnt.usb_armed_out[ep_idx]++; });
     ep_state_t *ep = in ? &ep_in[ep_idx] : &ep_out[ep_idx];
     if (!ep->enable) {
         return false;
@@ -717,6 +730,7 @@ bool dcd_edpt_xfer(uint8_t rhport, uint8_t ep_addr, uint8_t *buffer, uint16_t to
              * when told the control transfer is done. */
             ep->active = false;
             control_transfer_done();
+            DIAG(if (in) { diag_cnt.usb_done_in[0]++; } else { diag_cnt.usb_done_out[0]++; });
             dcd_event_xfer_complete(0, ep_addr, 0, XFER_RESULT_SUCCESS, is_isr);
             return true;
         }
@@ -800,6 +814,45 @@ void dcd_edpt_clear_stall(uint8_t rhport, uint8_t ep_addr)
     }
 }
 
+#if DS5_BL616_DIAG_LOG
+/* The SETUP requests that change the device's state are logged as they come;
+ * SET_REPORT is only counted, by report ID. */
+static void diag_usb_setup(const uint8_t *s)
+{
+    const uint32_t t = (uint32_t)bflb_mtimer_get_time_ms();
+    const uint8_t type = s[0], req = s[1];
+    const uint16_t value = (uint16_t)(s[2] | (s[3] << 8));
+    const uint16_t index = (uint16_t)(s[4] | (s[5] << 8));
+    diag_cnt.usb_setup++;
+    diag_note_usb_isr(1, s);
+    if (type == 0x00 && req == 0x05) {
+        diag_logf("[usb] t=%lu SET_ADDRESS %u\r\n", (unsigned long)t, value);
+    } else if (type == 0x00 && req == 0x09) {
+        diag_logf("[usb] t=%lu SET_CONFIGURATION %u\r\n", (unsigned long)t, value);
+    } else if (type == 0x01 && req == 0x0B) {
+        diag_logf("[usb] t=%lu SET_INTERFACE itf %u alt %u\r\n", (unsigned long)t, index, value);
+    } else if (type == 0x21 && req == 0x09) {
+        diag_cnt.usb_set_report[value & 0xFF]++;
+    }
+}
+
+/* Read only: the error bits of the interrupt groups, masked ones included
+ * (none of them is enabled, so none is ever cleared). */
+void bl616_dcd_diag_status(uint32_t *isg0, uint32_t *isg2, uint32_t *isg3, int *started, int *connected)
+{
+    *started = g_started ? 1 : 0;
+    *connected = g_want_connected ? 1 : 0;
+    if (!g_started) {
+        *isg0 = *isg2 = *isg3 = 0;
+        return;
+    }
+    *isg0 = getreg32(BFLB_USB_BASE + USB_DEV_ISG0_OFFSET) & (USB_CX_COMFAIL_INT | USB_CX_COMABT_INT);
+    *isg2 = getreg32(BFLB_USB_BASE + USB_DEV_ISG2_OFFSET) & (USB_ISO_SEQ_ERR_INT | USB_ISO_SEQ_ABORT_INT | USB_DMA_ERROR_HOV);
+    *isg3 = getreg32(BFLB_USB_BASE + USB_DEV_ISG3_OFFSET) &
+            (USB_VDMA_ERROR_CXF | USB_VDMA_ERROR_F0 | USB_VDMA_ERROR_F1 | USB_VDMA_ERROR_F2 | USB_VDMA_ERROR_F3);
+}
+#endif
+
 /* ---------------------------------------------------------------- interrupt */
 
 static void complete_out(uint8_t ep_addr, ep_state_t *ep, uint32_t len)
@@ -808,6 +861,8 @@ static void complete_out(uint8_t ep_addr, ep_state_t *ep, uint32_t len)
     if (len != 0 && addr_is_cached(ep->buf)) {
         bflb_l1c_dcache_invalidate_range(ep->buf, len);
     }
+    DIAG(diag_cnt.usb_done_out[ep_addr & 0x0F]++;
+         if ((ep_addr & 0x0F) == 3 && len != 0 && ep->buf != NULL) { diag_cnt.usb_out_report[ep->buf[0]]++; });
     dcd_event_xfer_complete(0, ep_addr, len, XFER_RESULT_SUCCESS, true);
 }
 
@@ -831,6 +886,7 @@ void dcd_int_handler(uint8_t rhport)
             while (getreg32(BFLB_USB_BASE + USB_VDMA_CXFPS1_OFFSET) & USB_VDMA_START_CXF) {
             }
             group_int_clear(3, USB_VDMA_CMPLT_CXF);
+            DIAG(diag_usb_setup(setup_buf));
             dcd_event_setup_received(0, setup_buf, true);
         }
     }
@@ -840,6 +896,7 @@ void dcd_int_handler(uint8_t rhport)
 
         if (status & USB_SUSP_INT) {
             group_int_clear(2, USB_SUSP_INT);
+            DIAG(diag_cnt.usb_suspend++; diag_logf("[usb] t=%lu suspend\r\n", (unsigned long)bflb_mtimer_get_time_ms()));
             /* Unlike the SDK driver, the FIFOs are NOT reset here: TinyUSB
              * keeps an endpoint busy until its transfer completes, so a report
              * dropped on suspend would leave that endpoint stuck after resume.
@@ -848,6 +905,7 @@ void dcd_int_handler(uint8_t rhport)
         }
         if (status & USB_RESM_INT) {
             group_int_clear(2, USB_RESM_INT);
+            DIAG(diag_cnt.usb_resume++; diag_logf("[usb] t=%lu resume\r\n", (unsigned long)bflb_mtimer_get_time_ms()));
             dcd_event_bus_signal(0, DCD_EVENT_RESUME, true);
         }
         if (status & USB_TX0BYTE_INT) {
@@ -856,6 +914,7 @@ void dcd_int_handler(uint8_t rhport)
                 if (txz & (1u << (i - 1))) {
                     putreg32((1u << (i - 1)), BFLB_USB_BASE + USB_DEV_TXZ_OFFSET);
                     ep_in[i].active = false;
+                    DIAG(diag_cnt.usb_done_in[i]++);
                     dcd_event_xfer_complete(0, (uint8_t)(i | TUSB_DIR_IN_MASK), 0, XFER_RESULT_SUCCESS, true);
                 }
             }
@@ -886,6 +945,9 @@ void dcd_int_handler(uint8_t rhport)
             putreg32(regval, BFLB_USB_BASE + USB_DEV_SMT_OFFSET);
 
             ep0_reset_state();
+            DIAG(diag_cnt.usb_bus_reset++;
+                 diag_logf("[usb] t=%lu bus reset, %s speed\r\n", (unsigned long)bflb_mtimer_get_time_ms(),
+                           port_speed() == TUSB_SPEED_HIGH ? "high" : (port_speed() == TUSB_SPEED_FULL ? "full" : "low")));
             dcd_event_bus_reset(0, port_speed(), true);
         }
     }
@@ -898,6 +960,7 @@ void dcd_int_handler(uint8_t rhport)
             if (ep_in[0].active) {
                 ep_in[0].active = false;
                 uint32_t const n = ep_in[0].len - vdma_remain(USB_FIFO_CXF);
+                DIAG(diag_cnt.usb_done_in[0]++);
                 dcd_event_xfer_complete(0, TUSB_DIR_IN_MASK, n, XFER_RESULT_SUCCESS, true);
             } else if (ep_out[0].active) {
                 uint32_t const n = ep_out[0].len - vdma_remain(USB_FIFO_CXF);
@@ -914,6 +977,7 @@ void dcd_int_handler(uint8_t rhport)
                 if (ep_in[ep_idx].active) {
                     ep_in[ep_idx].active = false;
                     uint32_t const n = ep_in[ep_idx].len - vdma_remain(fifo);
+                    DIAG(diag_cnt.usb_done_in[ep_idx]++);
                     dcd_event_xfer_complete(0, (uint8_t)(ep_idx | TUSB_DIR_IN_MASK), n, XFER_RESULT_SUCCESS, true);
                 } else if (ep_out[ep_idx].active) {
                     uint32_t const n = ep_out[ep_idx].len - vdma_remain(fifo);
